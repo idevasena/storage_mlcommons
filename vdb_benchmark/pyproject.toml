@@ -17,7 +17,8 @@ dependencies = [
     "pandas",
     "pymilvus",
     "pyyaml",
-    "tabulate"
+    "tabulate",
+    "psutil"
 ]
 
 [project.urls]

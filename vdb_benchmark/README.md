@@ -56,12 +56,82 @@ The benchmark process consists of three main steps:
 
 ### Step 1: Load Vectors into the Database
 Use the load_vdb.py script to generate and load 10 million vectors into your vector database: (this process can take up to 8 hours)
+
+#### Default/ Standard Mode
+
+##### Basic execution with config file
 ```bash
 python vdbbench/load_vdb.py --config vdbbench/configs/10m_diskann.yaml
 ```
 
+##### With explicit parameters (no config)
+```bash
+python vdbbench/load_vdb.py --collection-name benchmark_test \
+    --dimension 1536 \
+    --num-vectors 1000000 \
+    --batch-size 10000
+```
 
-For testing, I recommend using a smaller data by passing the num_vectors option:
+##### Override config values
+```bash
+python vdbbench/load_vdb.py --config vdbbench/configs/10m_diskann.yaml \
+    --collection-name custom_collection \
+    --num-vectors 500000 \
+    --force
+```
+
+##### With reproducible seed
+```bash
+python vdbbench/load_vdb.py --config vdbbench/configs/10m_diskann.yaml \
+    --seed 42
+```
+
+#### Adaptive Mode (Memory-Aware Batch Sizing)
+
+##### Enable adaptive batching (auto-scales based on memory pressure)
+```bash
+python vdbbench/load_vdb.py --config vdbbench/configs/100m_diskann.yaml \
+    --adaptive
+```
+
+##### With explicit memory budget
+```bash
+python vdbbench/load_vdb.py --config vdbbench/configs/100m_diskann.yaml \
+    --adaptive \
+    --memory-budget 4G
+```
+##### Adaptive with smaller budget for constrained systems
+```bash
+python vdbbench/load_vdb.py --config vdbbench/configs/100m_diskann.yaml \
+    --adaptive \
+    --memory-budget 2G \
+    --batch-size 5000
+```
+
+#### Disk-Backed Mode (Billion-Scale / Low Memory)
+
+##### Use memory-mapped temp file (default temp directory)
+```bash
+python vdbbench/load_vdb.py --config vdbbench/configs/1b_diskann.yaml \
+    --disk-backed
+```
+
+##### Specify fast NVMe for temp storage
+```bash
+python vdbbench/load_vdb.py --config vdbbench/configs/1b_diskann.yaml \
+    --disk-backed \
+    --temp-dir /mnt/nvme/tmp
+```
+
+##### Disk-backed with seed for reproducibility
+```bash
+python vdbbench/load_vdb.py --config vdbbench/configs/1b_diskann.yaml \
+    --disk-backed \
+    --temp-dir /mnt/nvme/tmp \
+    --seed 12345
+```
+
+For testing, we recommend using a smaller data by passing the num_vectors option:
 ```bash
 python vdbbench/load_vdb.py --config vdbbench/configs/10m_diskann.yaml --collection-name mlps_500k_10shards_1536dim_uniform_diskann --num-vectors 500000
 ```
