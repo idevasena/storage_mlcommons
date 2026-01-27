@@ -47,6 +47,17 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 import argparse
 import csv
+import logging
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
+
+# Optional YAML support for config file loading
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
 
 # Attempt to import optional GPU libraries (torch, cupy)
 # The benchmark can run in a CPU-only environment if these are not found.
@@ -62,8 +73,228 @@ try:
 except ImportError:
     CUPY_AVAILABLE = False
 
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
 
-# ============================================================================ 
+# Optional pandas/openpyxl for XLSX output
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
+
+# ============================================================================
+# CONFIGURATION LOADER
+# Loads benchmark configuration from YAML files with strict validation.
+# ============================================================================
+
+class ConfigLoader:
+    """
+    Loads and validates benchmark configuration from YAML files.
+    
+    Raises errors on invalid/unknown keys to prevent silent misconfigurations
+    in MLPerf competition submissions.
+    """
+    
+    # Define the valid configuration schema with expected types
+    VALID_SCHEMA = {
+        'user_templates': {
+            'chatbot': {'context_range': list, 'generation_range': list, 'think_time_range': list},
+            'coding': {'context_range': list, 'generation_range': list, 'think_time_range': list},
+            'document': {'context_range': list, 'generation_range': list, 'think_time_range': list},
+        },
+        'generation_timing': {
+            'none': (int, float),
+            'fast': (int, float),
+            'realistic': (int, float),
+        },
+        'qos_profiles': {
+            'interactive': {'target_latency_p95_ms': (int, float), 'target_latency_p99_ms': (int, float),
+                           'target_latency_p999_ms': (int, float), 'target_latency_p9999_ms': (int, float), 'priority': int},
+            'responsive': {'target_latency_p95_ms': (int, float), 'target_latency_p99_ms': (int, float),
+                          'target_latency_p999_ms': (int, float), 'target_latency_p9999_ms': (int, float), 'priority': int},
+            'batch': {'target_latency_p95_ms': (int, float), 'target_latency_p99_ms': (int, float),
+                     'target_latency_p999_ms': (int, float), 'target_latency_p9999_ms': (int, float), 'priority': int},
+        },
+        'qos_distribution': {
+            'interactive_probability': (int, float),
+            'responsive_threshold': (int, float),
+        },
+        'eviction': {
+            'max_recursion_depth': int,
+            'target_usage_ratio': (int, float),
+            'large_entry_limit_ratio': (int, float),
+            'max_evictions_hard_cap': int,
+            'max_evictions_min': int,
+        },
+        'gpu_backend': {
+            'memory_fraction': (int, float),
+            'max_eviction_attempts': int,
+            'free_memory_threshold': (int, float),
+        },
+        'prefix_cache': {
+            'min_prefix_length': int,
+            'max_prefix_entries': int,
+            'system_prompt_hit_probability': (int, float),
+        },
+        'rag': {
+            'chunk_size_tokens': int,
+            'top_k_chunks': int,
+            'max_chunk_bytes': int,
+        },
+        'conversation': {
+            'max_conversations': int,
+            'max_turns_per_conv': int,
+            'end_conversation_probability': (int, float),
+        },
+        'autoscaler': {
+            'min_users': int,
+            'max_users': int,
+            'scale_up_factor': (int, float),
+            'scale_down_factor': (int, float),
+            'consecutive_samples_required': int,
+        },
+        'decode': {
+            'batch_size': int,
+        },
+        'sharegpt': {
+            'max_context_tokens': int,
+            'max_generation_tokens': int,
+            'chars_per_token_estimate': int,
+        },
+        'saturation_detection': {
+            'read_latency_p95_threshold_ms': (int, float),
+            'write_latency_p95_threshold_ms': (int, float),
+            'queue_depth_threshold': int,
+            'history_window_size': int,
+        },
+        'validation_limits': {
+            'max_users': int,
+            'max_duration_seconds': int,
+            'max_gpu_memory_gb': int,
+            'max_cpu_memory_gb': int,
+        },
+    }
+    
+    def __init__(self, config_path: Optional[str] = None):
+        """
+        Initialize the ConfigLoader.
+        
+        Args:
+            config_path: Path to YAML config file. If None, uses built-in defaults.
+        """
+        self.config_path = config_path
+        self.config = {}
+        
+        if config_path:
+            self._load_and_validate(config_path)
+    
+    def _load_and_validate(self, config_path: str) -> None:
+        """Load YAML config and validate strictly against schema."""
+        if not YAML_AVAILABLE:
+            raise RuntimeError("pyyaml is required for config file support. Install with: pip install pyyaml")
+        
+        path = Path(config_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        with open(path, 'r') as f:
+            self.config = yaml.safe_load(f) or {}
+        
+        # Validate all keys against schema
+        self._validate_keys(self.config, self.VALID_SCHEMA, path_prefix='')
+        
+        logger.info(f"Loaded configuration from {config_path}")
+    
+    def _validate_keys(self, config: dict, schema: dict, path_prefix: str) -> None:
+        """Recursively validate config keys against schema. Raises on unknown keys."""
+        for key, value in config.items():
+            full_path = f"{path_prefix}.{key}" if path_prefix else key
+            
+            if key not in schema:
+                raise ValueError(f"Unknown configuration key: '{full_path}'. "
+                               f"Valid keys at this level: {list(schema.keys())}")
+            
+            expected_type = schema[key]
+            
+            # If schema expects a dict, recurse
+            if isinstance(expected_type, dict):
+                if not isinstance(value, dict):
+                    raise ValueError(f"Config key '{full_path}' must be a dict, got {type(value).__name__}")
+                self._validate_keys(value, expected_type, full_path)
+            else:
+                # Validate type
+                if isinstance(expected_type, tuple):
+                    if not isinstance(value, expected_type):
+                        raise ValueError(f"Config key '{full_path}' must be one of {expected_type}, "
+                                       f"got {type(value).__name__}")
+                elif not isinstance(value, expected_type):
+                    raise ValueError(f"Config key '{full_path}' must be {expected_type.__name__}, "
+                                   f"got {type(value).__name__}")
+    
+    def get(self, *keys, default=None):
+        """
+        Get a nested configuration value.
+        
+        Args:
+            *keys: Path to the config value (e.g., 'qos_profiles', 'interactive', 'priority')
+            default: Default value if key not found
+            
+        Returns:
+            The config value or default
+        """
+        value = self.config
+        for key in keys:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                return default
+        return value
+
+
+# Global config instance (set from main() when --config is provided)
+_global_config: Optional[ConfigLoader] = None
+
+
+def get_config() -> Optional[ConfigLoader]:
+    """Get the global configuration loader instance."""
+    return _global_config
+
+
+def set_config(config: ConfigLoader) -> None:
+    """Set the global configuration loader instance."""
+    global _global_config
+    _global_config = config
+
+
+def cfg(*keys, default=None):
+    """
+    Get a configuration value from the global config, with fallback to default.
+    
+    Args:
+        *keys: Path to the config value (e.g., 'qos_profiles', 'interactive', 'priority')
+        default: Default value if config not loaded or key not found
+        
+    Returns:
+        The config value or default
+    """
+    config = get_config()
+    if config is None:
+        return default
+    return config.get(*keys, default=default)
+
+
+# ============================================================================
 # CORE DATA MODELS
 # Defines the basic data structures used throughout the benchmark.
 # ============================================================================ 
@@ -194,8 +425,10 @@ class QoSSLA:
     Defines the performance targets and tracks violations.
     """
     qos_level: QoSLevel
-    target_latency_p95_ms: float # The 95th percentile latency target.
-    target_latency_p99_ms: float # The 99th percentile latency target.
+    target_latency_p95_ms: float   # The 95th percentile latency target.
+    target_latency_p99_ms: float   # The 99th percentile latency target.
+    target_latency_p999_ms: float  # The 99.9th percentile latency target (3 nines).
+    target_latency_p9999_ms: float # The 99.99th percentile latency target (4 nines).
     priority: int                  # An integer priority level (higher is more important).
 
     # SLA violation tracking
@@ -210,27 +443,44 @@ class QoSSLA:
         return 1.0 - (self.violations / self.total_requests)
 
 
-# Pre-defined QoS profiles mapping each level to a specific SLA.
-QOS_PROFILES = {
-    QoSLevel.INTERACTIVE: QoSSLA(
-        qos_level=QoSLevel.INTERACTIVE,
-        target_latency_p95_ms=50,
-        target_latency_p99_ms=100,
-        priority=3
-    ),
-    QoSLevel.RESPONSIVE: QoSSLA(
-        qos_level=QoSLevel.RESPONSIVE,
-        target_latency_p95_ms=100,
-        target_latency_p99_ms=200,
-        priority=2
-    ),
-    QoSLevel.BATCH: QoSSLA(
-        qos_level=QoSLevel.BATCH,
-        target_latency_p95_ms=1000,
-        target_latency_p99_ms=5000,
-        priority=1
-    )
+# Default QoS profile values (overridden by config.yaml when loaded)
+_DEFAULT_QOS_PROFILES = {
+    'interactive': {'target_latency_p95_ms': 50, 'target_latency_p99_ms': 100,
+                   'target_latency_p999_ms': 150, 'target_latency_p9999_ms': 200, 'priority': 3},
+    'responsive': {'target_latency_p95_ms': 100, 'target_latency_p99_ms': 200,
+                  'target_latency_p999_ms': 350, 'target_latency_p9999_ms': 500, 'priority': 2},
+    'batch': {'target_latency_p95_ms': 1000, 'target_latency_p99_ms': 5000,
+             'target_latency_p999_ms': 7500, 'target_latency_p9999_ms': 10000, 'priority': 1},
 }
+
+
+def get_qos_profiles() -> Dict[QoSLevel, QoSSLA]:
+    """
+    Returns QoS profiles, using config.yaml values if loaded, otherwise defaults.
+    """
+    profiles = {}
+    for level in QoSLevel:
+        level_key = level.value  # 'interactive', 'responsive', 'batch'
+        defaults = _DEFAULT_QOS_PROFILES[level_key]
+        
+        profiles[level] = QoSSLA(
+            qos_level=level,
+            target_latency_p95_ms=cfg('qos_profiles', level_key, 'target_latency_p95_ms',
+                                     default=defaults['target_latency_p95_ms']),
+            target_latency_p99_ms=cfg('qos_profiles', level_key, 'target_latency_p99_ms',
+                                     default=defaults['target_latency_p99_ms']),
+            target_latency_p999_ms=cfg('qos_profiles', level_key, 'target_latency_p999_ms',
+                                      default=defaults['target_latency_p999_ms']),
+            target_latency_p9999_ms=cfg('qos_profiles', level_key, 'target_latency_p9999_ms',
+                                       default=defaults['target_latency_p9999_ms']),
+            priority=cfg('qos_profiles', level_key, 'priority', default=defaults['priority']),
+        )
+    return profiles
+
+
+# For backward compatibility, QOS_PROFILES can still be used as a dict
+# but code should prefer get_qos_profiles() to pick up config changes
+QOS_PROFILES = get_qos_profiles()
 
 
 @dataclass
@@ -333,10 +583,10 @@ class ConversationState:
 class ConversationManager:
     """Manages the lifecycle of all multi-turn conversations and enables cache reuse."""
 
-    def __init__(self, max_conversations: int = 1000, max_turns_per_conv: int = 50):
+    def __init__(self, max_conversations: int = None, max_turns_per_conv: int = None):
         self.conversations: Dict[str, ConversationState] = {}
-        self.max_conversations = max_conversations
-        self.max_turns_per_conv = max_turns_per_conv
+        self.max_conversations = max_conversations if max_conversations is not None else cfg('conversation', 'max_conversations', default=1000)
+        self.max_turns_per_conv = max_turns_per_conv if max_turns_per_conv is not None else cfg('conversation', 'max_turns_per_conv', default=50)
         self.lock = threading.Lock() # Protects access to the shared conversations dictionary.
 
     def start_conversation(self, user_id: str, system_prompt: Optional[str] = None) -> str:
@@ -516,8 +766,8 @@ class PrefixMatcher:
         "You are a professional writing assistant.",
     ]
 
-    def __init__(self, min_prefix_length: int = 50):
-        self.min_prefix_length = min_prefix_length
+    def __init__(self, min_prefix_length: int = None):
+        self.min_prefix_length = min_prefix_length if min_prefix_length is not None else cfg('prefix_cache', 'min_prefix_length', default=50)
         self.prefix_index: Dict[str, PrefixCacheEntry] = {}
         self.prefix_frequency: Dict[str, int] = {}
         self.lock = threading.Lock()
@@ -529,8 +779,9 @@ class PrefixMatcher:
 
     def detect_system_prompt(self, context_tokens: int) -> Optional[PrefixCacheEntry]:
         """Simulates the detection of a common system prompt at the start of a request."""
-        # In this simulation, 20% of requests are assumed to start with a common system prompt.
-        if random.random() < 0.2:
+        # Probability of requests having a common system prompt (configurable, default 20%).
+        system_prompt_hit_probability = cfg('prefix_cache', 'system_prompt_hit_probability', default=0.2)
+        if random.random() < system_prompt_hit_probability:
             system_prompt = random.choice(self.COMMON_SYSTEM_PROMPTS)
             prefix_hash = self.hash_prefix(system_prompt, len(system_prompt.split()))
 
@@ -559,9 +810,9 @@ class PrefixMatcher:
 class PrefixCacheManager:
     """Orchestrates the prefix matching and caching logic."""
 
-    def __init__(self, cache, max_prefix_entries: int = 1000):
+    def __init__(self, cache, max_prefix_entries: int = None):
         self.cache = cache # A reference to the main MultiTierCache.
-        self.max_prefix_entries = max_prefix_entries
+        self.max_prefix_entries = max_prefix_entries if max_prefix_entries is not None else cfg('prefix_cache', 'max_prefix_entries', default=1000)
         self.prefix_matcher = PrefixMatcher()
         self.lock = threading.Lock()
 
@@ -653,10 +904,10 @@ class RAGQuery:
 class RAGDocumentManager:
     """Manages the ingestion and retrieval of RAG document chunks."""
 
-    def __init__(self, cache, chunk_size: int = 512, top_k_chunks: int = 5):
+    def __init__(self, cache, chunk_size: int = None, top_k_chunks: int = None):
         self.cache = cache # A reference to the main MultiTierCache.
-        self.chunk_size = chunk_size
-        self.top_k_chunks = top_k_chunks
+        self.chunk_size = chunk_size if chunk_size is not None else cfg('rag', 'chunk_size_tokens', default=512)
+        self.top_k_chunks = top_k_chunks if top_k_chunks is not None else cfg('rag', 'top_k_chunks', default=5)
         self.documents: Dict[str, RAGDocument] = {}
         self.chunk_index: Dict[str, RAGChunk] = {}
 
@@ -666,12 +917,12 @@ class RAGDocumentManager:
         This involves splitting it into chunks and pre-calculating and storing the
         KV cache for each chunk in the multi-tier cache.
         """
-        max_chunk_bytes = 256 * 1024**2 # Target ~256MB per chunk to limit memory pressure.
+        max_chunk_bytes = cfg('rag', 'max_chunk_bytes', default=256 * 1024**2)  # Target ~256MB per chunk
         bytes_per_token = max(model_config.kv_cache_size_per_token, 1)
         max_tokens_per_chunk = max(1, min(self.chunk_size, max_chunk_bytes // bytes_per_token))
 
         if max_tokens_per_chunk < self.chunk_size:
-            print(f"[RAG] Adjusting chunk size for {doc_id} to {max_tokens_per_chunk} tokens "
+            logger.debug(f"Adjusting chunk size for {doc_id} to {max_tokens_per_chunk} tokens "
                   f"to stay under {max_chunk_bytes / 1024**2:.0f} MB per chunk.")
 
         num_chunks = (total_tokens + max_tokens_per_chunk - 1) // max_tokens_per_chunk
@@ -702,14 +953,14 @@ class RAGDocumentManager:
                     num_tokens=chunk_tokens
                 )
             except MemoryError:
-                print(f"[RAG] MemoryError while ingesting chunk {chunk.chunk_id}; skipping remaining chunks.")
+                logger.error(f"MemoryError while ingesting chunk {chunk.chunk_id}; skipping remaining chunks.")
                 break
             except Exception as exc:
-                print(f"[RAG] Error ingesting chunk {chunk.chunk_id}: {exc}")
+                logger.error(f"Error ingesting chunk {chunk.chunk_id}: {exc}")
                 continue
 
             if not success:
-                print(f"[RAG] Warning: Failed to allocate cache for chunk {chunk.chunk_id}.")
+                logger.warning(f"Failed to allocate cache for chunk {chunk.chunk_id}.")
                 continue
 
             chunk.storage_tier = location
@@ -789,14 +1040,26 @@ class GPUMemoryBackend(StorageBackend):
     Uses PyTorch or CuPy for GPU operations. This is the fastest tier.
     """
 
-    def __init__(self, use_torch=True):
+    def __init__(self, use_torch=True, on_eviction_callback=None):
+        """
+        Initialize the GPU memory backend.
+
+        Args:
+            use_torch: Whether to use PyTorch (vs CuPy) for GPU operations.
+            on_eviction_callback: Optional callback function called when entries are evicted
+                                  during OOM handling. Signature: callback(key: str, tier: str)
+                                  This allows the parent CacheManager to sync its metadata.
+        """
+        self.on_eviction_callback = on_eviction_callback
+
         if use_torch and TORCH_AVAILABLE:
             self.backend = 'torch'
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             if self.device.type == 'cpu':
                 raise RuntimeError("No GPU available for PyTorch backend")
             # Pre-allocate a large chunk of GPU memory to simulate a real server environment.
-            torch.cuda.set_per_process_memory_fraction(0.8, 0)
+            memory_fraction = cfg('gpu_backend', 'memory_fraction', default=0.8)
+            torch.cuda.set_per_process_memory_fraction(memory_fraction, 0)
             torch.cuda.empty_cache()
         elif CUPY_AVAILABLE:
             self.backend = 'cupy'
@@ -813,16 +1076,65 @@ class GPUMemoryBackend(StorageBackend):
         Writes a NumPy array from CPU to GPU VRAM.
         Uses pinned memory and non-blocking transfers for maximum performance.
         """
-        # Simple eviction mechanism if GPU runs out of memory.
+        # FIX: Iterative eviction mechanism for GPU OOM handling.
+        # The original code only evicted ONE entry which is insufficient for large allocations.
+        # We now evict multiple entries until there's enough space or we've exhausted options.
         if self.backend == 'torch' and torch.cuda.is_available():
-            free_memory = torch.cuda.mem_get_info()[0]
-            if data.nbytes > free_memory * 0.9:
+            required_bytes = data.nbytes
+            max_eviction_attempts = cfg('gpu_backend', 'max_eviction_attempts', default=100)
+            eviction_count = 0
+            # Threshold for free memory (inverted: 0.1 means keep 10% free, so use 90%)
+            free_memory_threshold = cfg('gpu_backend', 'free_memory_threshold', default=0.1)
+            usable_fraction = 1.0 - free_memory_threshold  # e.g., 0.9 if threshold is 0.1
+
+            while eviction_count < max_eviction_attempts:
+                free_memory = torch.cuda.mem_get_info()[0]
+                # Use configurable threshold to leave headroom
+                if required_bytes <= free_memory * usable_fraction:
+                    break  # We have enough space
+
+                # Try clearing the CUDA cache first
                 torch.cuda.empty_cache()
-                if data.nbytes > torch.cuda.mem_get_info()[0] * 0.9:
-                    if len(self.cache) > 0:
-                        oldest_key = list(self.cache.keys())[0]
-                        del self.cache[oldest_key]
-                        torch.cuda.empty_cache()
+                free_memory = torch.cuda.mem_get_info()[0]
+                if required_bytes <= free_memory * usable_fraction:
+                    break
+
+                # If no entries to evict, we're out of options
+                if len(self.cache) == 0:
+                    # Log warning and let the allocation proceed (it may OOM)
+                    logger.warning(
+                        f"GPU OOM: Need {required_bytes / 1024**2:.1f}MB, "
+                        f"have {free_memory / 1024**2:.1f}MB, no entries to evict"
+                    )
+                    break
+
+                # Evict the oldest entry (first key in dict, which is insertion-ordered)
+                oldest_key = next(iter(self.cache))
+                evicted_tensor = self.cache.pop(oldest_key)
+                evicted_size = evicted_tensor.element_size() * evicted_tensor.nelement()
+                del evicted_tensor
+
+                # Also clean up pinned memory if present
+                if oldest_key in self.pinned_memory:
+                    del self.pinned_memory[oldest_key]
+
+                # Notify parent CacheManager to sync its metadata
+                if self.on_eviction_callback:
+                    try:
+                        self.on_eviction_callback(oldest_key, 'gpu', evicted_size)
+                    except Exception as e:
+                        logger.warning(f"GPU eviction callback failed for {oldest_key}: {e}")
+
+                eviction_count += 1
+                logger.debug(
+                    f"GPU eviction #{eviction_count}: evicted {oldest_key} "
+                    f"({evicted_size / 1024**2:.1f}MB)"
+                )
+
+            # Final cache clear after evictions
+            if eviction_count > 0:
+                torch.cuda.empty_cache()
+                logger.debug(f"GPU: evicted {eviction_count} entries to make room for {key}")
 
         start = time.perf_counter()
 
@@ -1044,8 +1356,7 @@ class NVMeBackend(StorageBackend):
     def __del__(self):
         """Cleans up the temporary directory when the object is destroyed."""
         if self.temp_dir:
-            import shutil
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            self.temp_dir.cleanup()
 
 
 class KVCacheGenerator:
@@ -1061,7 +1372,7 @@ class KVCacheGenerator:
         self.buffer_size_elements = 128 * 1024 * 1024  # 128 million elements (~256MB for float16)
         self.dtype = np.float16 if 'float16' in self.model_config.dtype else np.float32
         
-        print(f"[KVCacheGenerator] Pre-generating {self.buffer_size_elements * 2 / 1024**2:.0f} MB noise buffer...")
+        logger.info(f"Pre-generating {self.buffer_size_elements * 2 / 1024**2:.0f} MB noise buffer...")
         rng = np.random.default_rng(self.global_seed)
         self.precomputed_buffer = rng.uniform(-1.0, 1.0, size=self.buffer_size_elements).astype(self.dtype)
 
@@ -1146,9 +1457,13 @@ class MultiTierCache:
         self.backends = {}
         try:
             if TORCH_AVAILABLE or CUPY_AVAILABLE:
-                self.backends['gpu'] = GPUMemoryBackend(use_torch=TORCH_AVAILABLE)
+                # Pass eviction callback to sync metadata when GPU OOM forces evictions
+                self.backends['gpu'] = GPUMemoryBackend(
+                    use_torch=TORCH_AVAILABLE,
+                    on_eviction_callback=self._handle_gpu_eviction
+                )
         except Exception as e:
-            print(f"Warning: Could not initialize GPU backend: {e}")
+            logger.warning(f"Could not initialize GPU backend: {e}")
 
         self.backends['cpu'] = CPUMemoryBackend()
         self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
@@ -1174,22 +1489,41 @@ class MultiTierCache:
             self.allocation_semaphore = None
 
         # Dictionary for collecting a wide range of performance metrics.
+        # NAMING CONVENTION (MLPerf v3.0):
+        #   - "storage" refers to the NVMe/SSD tier (was "nvme" in earlier versions)
+        #   - "tier_X_kv_bytes_written" = KV cache bytes written to tier X
+        #   - "tier_X_kv_bytes_read" = KV cache bytes read from tier X
         self.stats = {
             'cache_hits': 0,
             'cache_misses': 0,
             'evictions': 0,
-            'offloads_cpu': 0, # Prefills that went directly to CPU.
-            'offloads_nvme': 0, # Prefills that went directly to NVMe.
+            'offloads_cpu': 0,     # Writes that went directly to CPU tier.
+            'offloads_storage': 0, # Writes that went directly to Storage tier.
 
             # Latency lists for each tier and operation.
-            'gpu_read_latencies': [], 'cpu_read_latencies': [], 'nvme_read_latencies': [],
-            'gpu_write_latencies': [], 'cpu_write_latencies': [], 'nvme_write_latencies': [],
-            'nvme_read_device_latencies': [], 'nvme_read_host_latencies': [],
-            'nvme_write_device_latencies': [], 'nvme_write_host_latencies': [],
+            #
+            # LATENCY TERMINOLOGY:
+            # - Total latency = Host + Device latency (full operation time)
+            # - Host latency = CPU/memory work (serialization, copying, page cache ops)
+            # - Device latency = Actual storage I/O (fsync for writes, file read for reads)
+            #
+            # For Storage tier (NVMe/SSD):
+            #   Write: host = np.save() time, device = fsync() time
+            #   Read:  host = page cache drop + array copy, device = np.load() time
+            #
+            'gpu_read_latencies': [], 'cpu_read_latencies': [], 'storage_read_latencies': [],
+            'gpu_write_latencies': [], 'cpu_write_latencies': [], 'storage_write_latencies': [],
+            # Storage-tier-specific breakdown (device = disk I/O, host = serialization)
+            'storage_read_device_latencies': [], 'storage_read_host_latencies': [],
+            'storage_write_device_latencies': [], 'storage_write_host_latencies': [],
 
-            # Phase-specific I/O metrics.
+            # Phase-specific I/O metrics (aggregate - kept for backward compatibility).
             'prefill_writes': 0, 'decode_reads': 0,
-            'prefill_bytes_written': 0, 'decode_bytes_read': 0,
+
+            # Tier-specific KV cache bytes (NEW NAMING - MLPerf v3.0)
+            # Written = data stored to tier, Read = data retrieved from tier
+            'tier_gpu_kv_bytes_written': 0, 'tier_cpu_kv_bytes_written': 0, 'tier_storage_kv_bytes_written': 0,
+            'tier_gpu_kv_bytes_read': 0, 'tier_cpu_kv_bytes_read': 0, 'tier_storage_kv_bytes_read': 0,
 
             # Cache type metrics for analyzing hit sources.
             'system_prompt_hits': 0, 'common_phrase_hits': 0,
@@ -1199,8 +1533,8 @@ class MultiTierCache:
             'total_read_bytes': 0, 'total_write_bytes': 0,
             'read_operations': 0, 'write_operations': 0,
 
-            # New counter for NVMe tokens processed (for throughput assessment)
-            'nvme_tokens_processed': 0,
+            # Counter for storage tier tokens processed (for throughput assessment)
+            'storage_tokens_processed': 0,
         }
 
     def _get_entry_lock(self, key: str) -> threading.Lock:
@@ -1209,6 +1543,33 @@ class MultiTierCache:
             if key not in self.entry_locks:
                 self.entry_locks[key] = threading.Lock()
             return self.entry_locks[key]
+
+    def _handle_gpu_eviction(self, key: str, tier: str, evicted_size: int) -> None:
+        """
+        Callback invoked by GPUMemoryBackend when it evicts entries during OOM handling.
+
+        This syncs the CacheManager's metadata with the actual GPU cache state.
+        Without this callback, cache_entries would still reference evicted entries,
+        causing KeyErrors on subsequent read attempts.
+
+        Args:
+            key: The cache key that was evicted
+            tier: The tier from which eviction occurred (always 'gpu' for this callback)
+            evicted_size: Size in bytes of the evicted entry
+        """
+        with self.metadata_lock:
+            if key in self.cache_entries:
+                del self.cache_entries[key]
+            if key in self.entry_locks:
+                del self.entry_locks[key]
+
+        with self.memory_lock:
+            self.gpu_memory_used = max(0, self.gpu_memory_used - evicted_size)
+
+        with self.stats_lock:
+            self.stats['evictions'] += 1
+
+        logger.debug(f"GPU eviction synced: removed {key} from cache metadata")
 
     # ========================================================================
     # WATERFALL LRU EVICTION METHODS
@@ -1328,39 +1689,24 @@ class MultiTierCache:
                     if to_tier == 'cpu':
                         self.stats['offloads_cpu'] += 1
                     elif to_tier == 'nvme':
-                        self.stats['offloads_nvme'] += 1
-                        # Track tokens processed for NVMe throughput calculation
-                        # Assuming size is bytes, and we know dtype size from model config
-                        # But simpler: we can estimate tokens from size if needed, or just track bytes
-                        # The user asked for 'nvme_tokens_processed'.
-                        # We can approximate tokens = size / (2 * layers * heads * dim * dtype_size)
-                        # Or just use the 'num_tokens' if we had it.
-                        # Since we don't have num_tokens easily here without looking up the key again or storing it,
-                        # let's look at the entry dict which should have it if we stored it.
-                        # The current cache_entries dict stores: 'location', 'size', 'last_access', 'access_count'.
-                        # It does NOT store num_tokens.
-                        # However, size is directly proportional.
-                        # Let's just track bytes for now and convert later if needed, OR
-                        # better yet, let's add num_tokens to the cache entry metadata in allocate_cache.
-                        # For now, to fix the immediate request without changing data structures too much:
-                        # We will estimate tokens based on size.
-                        # size = num_tokens * layers * 2 * heads * dim * 2 (for float16)
-                        # so num_tokens = size / (layers * 4 * heads * dim)
-                        bytes_per_token = (
-                            self.model_config.num_layers * 
-                            2 * # K and V
-                            self.model_config.kv_heads * 
-                            self.model_config.kv_dim_per_head * 
-                            2 # float16 bytes
-                        )
-                        tokens = int(size / bytes_per_token)
-                        self.stats['nvme_tokens_processed'] += tokens
+                        self.stats['offloads_storage'] += 1
+                        # Track tokens processed for Storage tier throughput calculation
+                        # FIX: Use pre-computed property to avoid integer overflow on 32-bit systems.
+                        # The ModelConfig.kv_cache_size_per_token property already computes this correctly.
+                        # Python 3's // operator uses arbitrary-precision integers, avoiding overflow.
+                        bytes_per_token = self.model_config.kv_cache_size_per_token
+                        if bytes_per_token > 0:
+                            # Pure integer division - Python 3 int has unlimited precision
+                            tokens = size // bytes_per_token
+                            self.stats['storage_tokens_processed'] += tokens
+                        else:
+                            logger.warning("bytes_per_token is 0, skipping token count update")
                 
                 total_latency = read_timing.total + write_timing.total
                 return True, total_latency
                 
             except Exception as e:
-                print(f"[KVCache] Failed to demote {key} from {from_tier} to {to_tier}: {e}")
+                logger.error(f"Failed to demote {key} from {from_tier} to {to_tier}: {e}")
                 return False, 0.0
 
     def _ensure_space_in_tier(self, tier: str, required_bytes: int, recursion_depth: int = 0) -> bool:
@@ -1386,10 +1732,10 @@ class MultiTierCache:
         if tier == 'nvme':
             return True
         
-        # Safety limit to prevent runaway eviction cascades
-        max_recursion = 10
+        # Safety limit to prevent runaway eviction cascades (configurable)
+        max_recursion = cfg('eviction', 'max_recursion_depth', default=10)
         if recursion_depth > max_recursion:
-            print(f"[KVCache] Warning: Hit recursion limit in _ensure_space_in_tier")
+            logger.warning("Hit recursion limit in _ensure_space_in_tier")
             return False
         
         tier_order = self._get_tier_order()
@@ -1403,28 +1749,31 @@ class MultiTierCache:
             return False
         
         limit = self._get_tier_limit(tier)
-        target_usage = limit * 0.8  # Keep 20% buffer consistent with original code
+        target_usage_ratio = cfg('eviction', 'target_usage_ratio', default=0.8)
+        target_usage = limit * target_usage_ratio  # Keep buffer consistent with config
         
         # If the entry is larger than the tier can physically hold, skip to next tier
-        if required_bytes > limit * 0.95:  # Allow up to 95% for a single large entry
+        large_entry_limit_ratio = cfg('eviction', 'large_entry_limit_ratio', default=0.95)
+        if required_bytes > limit * large_entry_limit_ratio:
             return False
         
         # Calculate a reasonable eviction limit based on tier capacity.
         # For large models (e.g., 70B), entries can be hundreds of MB each,
         # so we may need to evict many entries to make room for one large request.
-        # Use the number of entries in the tier as a guide, with a minimum of 1000.
+        # Use the number of entries in the tier as a guide, with a minimum from config.
         entries_in_tier = len(self._get_lru_entries_in_tier(tier))
         # FIX: Cap the max evictions to prevent infinite loops if we can't clear enough space
         # The previous logic could loop forever if entries_in_tier kept growing or didn't reduce fast enough.
-        # We set a hard cap of 5000 or slightly more than current entries.
-        max_evictions_per_call = min(5000, max(1000, entries_in_tier + 100))
+        max_evictions_hard_cap = cfg('eviction', 'max_evictions_hard_cap', default=5000)
+        max_evictions_min = cfg('eviction', 'max_evictions_min', default=1000)
+        max_evictions_per_call = min(max_evictions_hard_cap, max(max_evictions_min, entries_in_tier + 100))
         eviction_count = 0
         
         while eviction_count < max_evictions_per_call:
             # Check if we have enough space now
             with self.memory_lock:
                 current_usage = self._get_tier_usage(tier)
-                # Normal case: fit within the 80% target
+                # Normal case: fit within the target
                 if current_usage + required_bytes <= target_usage:
                     # FIX: Atomic Reservation
                     # We must reserve the space NOW, inside the lock, to prevent other threads
@@ -1432,8 +1781,8 @@ class MultiTierCache:
                     self._update_tier_usage(tier, required_bytes)
                     return True
                 
-                # Large entry case: if we've cleared the tier, allow up to 95% of limit
-                if current_usage < limit * 0.05 and required_bytes <= limit * 0.95:
+                # Large entry case: if we've cleared the tier, allow up to large_entry_limit_ratio of limit
+                if current_usage < limit * 0.05 and required_bytes <= limit * large_entry_limit_ratio:
                     # FIX: Atomic Reservation here too
                     self._update_tier_usage(tier, required_bytes)
                     return True
@@ -1481,7 +1830,7 @@ class MultiTierCache:
             
             # Recursively ensure the next tier has space for this entry
             if not self._ensure_space_in_tier(next_tier, lru_size, recursion_depth + 1):
-                print(f"[KVCache] Warning: Could not make space in {next_tier} for demotion")
+                logger.warning(f"Could not make space in {next_tier} for demotion")
                 # If we can't move the LRU item, we can't make space. 
                 # We should probably abort to avoid spinning.
                 return False
@@ -1536,10 +1885,10 @@ class MultiTierCache:
         try:
             data = self.generator.generate(sequence_length=num_tokens, key=key)
         except MemoryError:
-            print(f"[KVCache] MemoryError generating cache for key {key} ({num_tokens} tokens)")
+            logger.error(f"MemoryError generating cache for key {key} ({num_tokens} tokens)")
             return False, 'none', 0.0
         except Exception as exc:
-            print(f"[KVCache] Failed to generate cache for key {key}: {exc}")
+            logger.error(f"Failed to generate cache for key {key}: {exc}")
             return False, 'none', 0.0
 
         size_bytes = data.nbytes
@@ -1548,7 +1897,6 @@ class MultiTierCache:
         with self.stats_lock:
             if phase == InferencePhase.PREFILL:
                 self.stats['prefill_writes'] += 1
-                self.stats['prefill_bytes_written'] += size_bytes
             self.stats['write_operations'] += 1
             self.stats['total_write_bytes'] += size_bytes
 
@@ -1589,7 +1937,7 @@ class MultiTierCache:
                 allocated_tier = tier
                 break
         
-        # Final fallback to NVMe if all else fails
+        # Final fallback to storage tier if all else fails
         if allocated_tier is None:
             allocated_tier = 'nvme'
 
@@ -1611,17 +1959,23 @@ class MultiTierCache:
                     'access_count': 1
                 }
 
-            # Record latency and offload stats.
+            # Record latency, offload stats, and tier-specific KV bytes written.
             with self.stats_lock:
+                # Map internal tier name to stats key ('nvme' -> 'storage')
+                tier_stats_name = 'storage' if allocated_tier == 'nvme' else allocated_tier
+                
+                # Track KV bytes written per tier
+                self.stats[f'tier_{tier_stats_name}_kv_bytes_written'] += size_bytes
+
                 if allocated_tier == 'cpu':
                     self.stats['offloads_cpu'] += 1
                     self.stats['cpu_write_latencies'].append(timing.total)
                 elif allocated_tier == 'nvme':
-                    self.stats['offloads_nvme'] += 1
-                    self.stats['nvme_write_latencies'].append(timing.total)
-                    self.stats['nvme_write_device_latencies'].append(timing.device)
-                    self.stats['nvme_write_host_latencies'].append(timing.host)
-                    self.stats['nvme_tokens_processed'] += num_tokens
+                    self.stats['offloads_storage'] += 1
+                    self.stats['storage_write_latencies'].append(timing.total)
+                    self.stats['storage_write_device_latencies'].append(timing.device)
+                    self.stats['storage_write_host_latencies'].append(timing.host)
+                    self.stats['storage_tokens_processed'] += num_tokens
                 elif allocated_tier == 'gpu':
                     self.stats['gpu_write_latencies'].append(timing.total)
 
@@ -1679,15 +2033,20 @@ class MultiTierCache:
                 elif cache_type == 'multi_turn': self.stats['multi_turn_hits'] += 1
                 else: self.stats['user_cache_hits'] += 1
 
-                # Track phase-specific I/O.
+                # Map internal tier name to stats key ('nvme' -> 'storage')
+                tier_stats_name = 'storage' if location == 'nvme' else location
+
+                # Track KV bytes read per tier
+                self.stats[f'tier_{tier_stats_name}_kv_bytes_read'] += entry_size
+
+                # Track aggregate decode reads
                 if phase == InferencePhase.DECODE:
                     self.stats['decode_reads'] += 1
-                    self.stats['decode_bytes_read'] += entry_size
 
                 self.stats['read_operations'] += 1
                 self.stats['total_read_bytes'] += entry_size
 
-            # Perform the actual read from the correct backend (GPU, CPU, or NVMe).
+            # Perform the actual read from the correct backend (GPU, CPU, or Storage).
             try:
                 _, timing = self.backends[location].read(key)
 
@@ -1698,16 +2057,15 @@ class MultiTierCache:
                     elif location == 'cpu':
                         self.stats['cpu_read_latencies'].append(timing.total)
                     else:
-                        self.stats['nvme_read_latencies'].append(timing.total)
-                        self.stats['nvme_read_device_latencies'].append(timing.device)
-                        self.stats['nvme_read_host_latencies'].append(timing.host)
+                        self.stats['storage_read_latencies'].append(timing.total)
+                        self.stats['storage_read_device_latencies'].append(timing.device)
+                        self.stats['storage_read_host_latencies'].append(timing.host)
                         
-                        #The access_cache function already retrieves the size of the entry in bytes: entry_size = entry['size'].
-                        #The number of tokens can be calculated by dividing entry_size by the size of a single token's KV cache, which is available via self.model_config.kv_cache_size_per_token.
-                        #This calculation should happen only when the read is from the 'nvme' tier.
+                        # Calculate tokens from entry size for throughput assessment.
+                        # This calculation applies only for the storage tier.
                         if self.model_config.kv_cache_size_per_token > 0:
                             num_tokens = entry_size / self.model_config.kv_cache_size_per_token
-                            self.stats['nvme_tokens_processed'] += num_tokens
+                            self.stats['storage_tokens_processed'] += num_tokens
 
                 return location, timing.total
             except Exception as e:
@@ -1724,10 +2082,10 @@ class MultiTierCache:
 
         # Throughput-focused profile for MLPerf submission
         if self.performance_profile == 'throughput':
-            # Criterion: Throughput should be based on tokens processed by the NVMe tier.
-            nvme_tokens = self.stats.get('nvme_tokens_processed', 0)
+            # Criterion: Throughput should be based on tokens processed by the storage tier.
+            storage_tokens = self.stats.get('storage_tokens_processed', 0)
             # Correctly use the benchmark's full duration for an accurate tok/s calculation.
-            throughput = nvme_tokens / duration if duration > 0 else 0
+            throughput = storage_tokens / duration if duration > 0 else 0
             
             passed = throughput > 0  # Simple check to ensure it ran
             criteria.append({
@@ -1744,29 +2102,33 @@ class MultiTierCache:
             }
 
         # Latency-focused profile (default)
-        # Criterion 1: NVMe Write P95 latency should be less than 500ms.
-        nvme_write_device = self.stats.get('nvme_write_device_latencies', [])
-        nvme_write_total = self.stats.get('nvme_write_latencies', [])
-        nvme_write_basis = nvme_write_device if nvme_write_device else nvme_write_total
-        if nvme_write_basis:
-            nvme_write_p95 = np.percentile(nvme_write_basis, 95) * 1000
-            passed = nvme_write_p95 < 500
+        # Criterion 1: Storage tier Write Device P95 latency should be less than 500ms.
+        # "Device" = actual disk I/O (fsync), excludes serialization overhead.
+        storage_write_device = self.stats.get('storage_write_device_latencies', [])
+        storage_write_total = self.stats.get('storage_write_latencies', [])
+        storage_write_basis = storage_write_device if storage_write_device else storage_write_total
+        latency_type = 'Device' if storage_write_device else 'Total'
+        if storage_write_basis:
+            storage_write_p95 = np.percentile(storage_write_basis, 95) * 1000
+            passed = storage_write_p95 < 500
             criteria.append({
-                'name': 'NVMe Write P95 < 500ms',
-                'target': 500, 'actual': nvme_write_p95, 'unit': 'ms', 'passed': passed
+                'name': f'Storage Tier Write {latency_type} P95 < 500ms',
+                'target': 500, 'actual': storage_write_p95, 'unit': 'ms', 'passed': passed
             })
             all_passed = all_passed and passed
 
-        # Criterion 2: NVMe Read P95 latency should be less than 200ms.
-        nvme_read_device = self.stats.get('nvme_read_device_latencies', [])
-        nvme_read_total = self.stats.get('nvme_read_latencies', [])
-        nvme_read_basis = nvme_read_device if nvme_read_device else nvme_read_total
-        if nvme_read_basis:
-            nvme_read_p95 = np.percentile(nvme_read_basis, 95) * 1000
-            passed = nvme_read_p95 < 200
+        # Criterion 2: Storage tier Read Device P95 latency should be less than 200ms.
+        # "Device" = actual disk I/O (np.load), excludes page cache/copy overhead.
+        storage_read_device = self.stats.get('storage_read_device_latencies', [])
+        storage_read_total = self.stats.get('storage_read_latencies', [])
+        storage_read_basis = storage_read_device if storage_read_device else storage_read_total
+        latency_type = 'Device' if storage_read_device else 'Total'
+        if storage_read_basis:
+            storage_read_p95 = np.percentile(storage_read_basis, 95) * 1000
+            passed = storage_read_p95 < 200
             criteria.append({
-                'name': 'NVMe Read P95 < 200ms',
-                'target': 200, 'actual': nvme_read_p95, 'unit': 'ms', 'passed': passed
+                'name': f'Storage Tier Read {latency_type} P95 < 200ms',
+                'target': 200, 'actual': storage_read_p95, 'unit': 'ms', 'passed': passed
             })
             all_passed = all_passed and passed
 
@@ -1822,22 +2184,45 @@ class MultiTierCache:
         # Get the pass/fail assessment.
         storage_health = self._evaluate_storage_performance(duration)
 
+        # Calculate per-tier bandwidth (GB/s)
+        tier_gpu_read_bytes = self.stats['tier_gpu_kv_bytes_read']
+        tier_gpu_write_bytes = self.stats['tier_gpu_kv_bytes_written']
+        tier_cpu_read_bytes = self.stats['tier_cpu_kv_bytes_read']
+        tier_cpu_write_bytes = self.stats['tier_cpu_kv_bytes_written']
+        tier_storage_read_bytes = self.stats['tier_storage_kv_bytes_read']
+        tier_storage_write_bytes = self.stats['tier_storage_kv_bytes_written']
+
         stats = {
             'cache_hit_rate': hit_rate,
             'cache_hits': stats_snapshot['cache_hits'],
             'cache_misses': stats_snapshot['cache_misses'],
             'gpu_entries': gpu_entries,
             'cpu_entries': cpu_entries,
-            'nvme_entries': nvme_entries,
+            'storage_entries': nvme_entries,  # Renamed from nvme_entries
             'gpu_memory_used_gb': gpu_mem_used / 1024**3,
             'cpu_memory_used_gb': cpu_mem_used / 1024**3,
             'offloads_cpu': stats_snapshot['offloads_cpu'],
-            'offloads_nvme': stats_snapshot['offloads_nvme'],
+            'offloads_storage': stats_snapshot['offloads_storage'],  # Renamed from offloads_nvme
             'storage_health': storage_health,
             'prefill_writes': self.stats['prefill_writes'],
             'decode_reads': self.stats['decode_reads'],
-            'prefill_bytes_written_gb': self.stats['prefill_bytes_written'] / 1024**3,
-            'decode_bytes_read_gb': self.stats['decode_bytes_read'] / 1024**3,
+
+            # Tier-specific KV cache bytes (NEW NAMING - MLPerf v3.0)
+            'tier_gpu_kv_bytes_written_gb': tier_gpu_write_bytes / 1024**3,
+            'tier_cpu_kv_bytes_written_gb': tier_cpu_write_bytes / 1024**3,
+            'tier_storage_kv_bytes_written_gb': tier_storage_write_bytes / 1024**3,
+            'tier_gpu_kv_bytes_read_gb': tier_gpu_read_bytes / 1024**3,
+            'tier_cpu_kv_bytes_read_gb': tier_cpu_read_bytes / 1024**3,
+            'tier_storage_kv_bytes_read_gb': tier_storage_read_bytes / 1024**3,
+
+            # Per-tier bandwidth metrics (GB/s)
+            'tier_gpu_read_bandwidth_gbps': (tier_gpu_read_bytes / 1024**3) / duration if duration > 0 else 0,
+            'tier_gpu_write_bandwidth_gbps': (tier_gpu_write_bytes / 1024**3) / duration if duration > 0 else 0,
+            'tier_cpu_read_bandwidth_gbps': (tier_cpu_read_bytes / 1024**3) / duration if duration > 0 else 0,
+            'tier_cpu_write_bandwidth_gbps': (tier_cpu_write_bytes / 1024**3) / duration if duration > 0 else 0,
+            'tier_storage_read_bandwidth_gbps': (tier_storage_read_bytes / 1024**3) / duration if duration > 0 else 0,
+            'tier_storage_write_bandwidth_gbps': (tier_storage_write_bytes / 1024**3) / duration if duration > 0 else 0,
+
             'system_prompt_hits': self.stats['system_prompt_hits'],
             'common_phrase_hits': self.stats['common_phrase_hits'],
             'user_cache_hits': self.stats['user_cache_hits'],
@@ -1849,32 +2234,41 @@ class MultiTierCache:
             'read_write_ratio': self.stats['total_read_bytes'] / max(self.stats['total_write_bytes'], 1),
             'read_iops': self.stats['read_operations'],
             'write_iops': self.stats['write_operations'],
+            'storage_tokens_processed': self.stats['storage_tokens_processed'],
         }
 
-        # Add latency percentiles for each tier.
-        for tier in ['gpu', 'cpu', 'nvme']:
+        # Add latency percentiles for each tier (including p99.9 and p99.99).
+        # Map internal tier names to output names ('nvme' -> 'storage')
+        tier_mapping = {'gpu': 'gpu', 'cpu': 'cpu', 'nvme': 'storage'}
+        for internal_tier, output_tier in [('gpu', 'gpu'), ('cpu', 'cpu'), ('storage', 'storage')]:
             for op in ['read', 'write']:
-                latencies = self.stats[f'{tier}_{op}_latencies']
+                latencies = self.stats.get(f'{internal_tier}_{op}_latencies', [])
                 if latencies:
                     lat_array = np.array(latencies)
-                    stats[f'{tier}_{op}_p50_ms'] = np.percentile(lat_array, 50) * 1000
-                    stats[f'{tier}_{op}_p95_ms'] = np.percentile(lat_array, 95) * 1000
-                    stats[f'{tier}_{op}_p99_ms'] = np.percentile(lat_array, 99) * 1000
+                    stats[f'{output_tier}_{op}_p50_ms'] = np.percentile(lat_array, 50) * 1000
+                    stats[f'{output_tier}_{op}_p95_ms'] = np.percentile(lat_array, 95) * 1000
+                    stats[f'{output_tier}_{op}_p99_ms'] = np.percentile(lat_array, 99) * 1000
+                    stats[f'{output_tier}_{op}_p999_ms'] = np.percentile(lat_array, 99.9) * 1000
+                    stats[f'{output_tier}_{op}_p9999_ms'] = np.percentile(lat_array, 99.99) * 1000
 
-        # Expose NVMe latency component breakdowns when present.
+        # Expose storage tier latency component breakdowns when present.
         for op in ['read', 'write']:
-            device_latencies = self.stats[f'nvme_{op}_device_latencies']
-            host_latencies = self.stats[f'nvme_{op}_host_latencies']
+            device_latencies = self.stats.get(f'storage_{op}_device_latencies', [])
+            host_latencies = self.stats.get(f'storage_{op}_host_latencies', [])
             if device_latencies:
                 device_array = np.array(device_latencies)
-                stats[f'nvme_{op}_device_p50_ms'] = np.percentile(device_array, 50) * 1000
-                stats[f'nvme_{op}_device_p95_ms'] = np.percentile(device_array, 95) * 1000
-                stats[f'nvme_{op}_device_p99_ms'] = np.percentile(device_array, 99) * 1000
+                stats[f'storage_{op}_device_p50_ms'] = np.percentile(device_array, 50) * 1000
+                stats[f'storage_{op}_device_p95_ms'] = np.percentile(device_array, 95) * 1000
+                stats[f'storage_{op}_device_p99_ms'] = np.percentile(device_array, 99) * 1000
+                stats[f'storage_{op}_device_p999_ms'] = np.percentile(device_array, 99.9) * 1000
+                stats[f'storage_{op}_device_p9999_ms'] = np.percentile(device_array, 99.99) * 1000
             if host_latencies:
                 host_array = np.array(host_latencies)
-                stats[f'nvme_{op}_host_p50_ms'] = np.percentile(host_array, 50) * 1000
-                stats[f'nvme_{op}_host_p95_ms'] = np.percentile(host_array, 95) * 1000
-                stats[f'nvme_{op}_host_p99_ms'] = np.percentile(host_array, 99) * 1000
+                stats[f'storage_{op}_host_p50_ms'] = np.percentile(host_array, 50) * 1000
+                stats[f'storage_{op}_host_p95_ms'] = np.percentile(host_array, 95) * 1000
+                stats[f'storage_{op}_host_p99_ms'] = np.percentile(host_array, 99) * 1000
+                stats[f'storage_{op}_host_p999_ms'] = np.percentile(host_array, 99.9) * 1000
+                stats[f'storage_{op}_host_p9999_ms'] = np.percentile(host_array, 99.99) * 1000
 
         return stats
 
@@ -1955,23 +2349,32 @@ class StorageMonitor:
         write_iops = int((write_delta / (16 * 1024)) / elapsed) if elapsed > 0 else 0
 
         # Default to 0.0 if the keys don't exist (e.g., at the start of the run).
-        read_latency_p95_ms = stats.get('nvme_read_p95_ms', 0.0)
-        write_latency_p95_ms = stats.get('nvme_write_p95_ms', 0.0)
+        read_latency_p95_ms = stats.get('storage_read_p95_ms', 0.0)
+        write_latency_p95_ms = stats.get('storage_write_p95_ms', 0.0)
 
         # --- Saturation Detection Logic ---
+        # Read thresholds from config (with fallback to original hardcoded values)
+        read_lat_threshold = cfg('saturation_detection', 'read_latency_p95_threshold_ms', default=100)
+        write_lat_threshold = cfg('saturation_detection', 'write_latency_p95_threshold_ms', default=50)
+        queue_depth_threshold = cfg('saturation_detection', 'queue_depth_threshold', default=100)
+        
         is_saturated = False
         if len(self.metrics_history) >= 2:
             # Compare with the previous metric
             prev_metric = self.metrics_history[-2]
-            if (prev_metric.read_latency_p95_ms < 100 and prev_metric.write_latency_p95_ms < 50 and prev_metric.queue_depth < 100):
+            if (prev_metric.read_latency_p95_ms < read_lat_threshold and 
+                prev_metric.write_latency_p95_ms < write_lat_threshold and 
+                prev_metric.queue_depth < queue_depth_threshold):
                 # If the previous metric was not saturated, check for a sudden increase in latency or queue depth
                 if (abs(prev_metric.read_latency_p95_ms - read_latency_p95_ms) > 20 or
                     abs(prev_metric.write_latency_p95_ms - write_latency_p95_ms) > 10 or
                     abs(prev_metric.queue_depth - queue_depth) > 10):
                     is_saturated = True
             else:
-                # If the previous metric was saturated, check if it's still above the thresholds
-                if (read_latency_p95_ms > 120 or write_latency_p95_ms > 60 or queue_depth > 120):
+                # If the previous metric was saturated, check if it's still above the thresholds (with 20% margin)
+                if (read_latency_p95_ms > read_lat_threshold * 1.2 or 
+                    write_latency_p95_ms > write_lat_threshold * 1.2 or 
+                    queue_depth > queue_depth_threshold * 1.2):
                     is_saturated = True
 
         # Create a new StorageMetrics object for this sample
@@ -2047,8 +2450,11 @@ class WorkloadAutoscaler:
         self.current_users = initial_users
         self.target_saturation = target_saturation
         self.scale_interval = scale_interval_seconds
-        self.min_users = 1
-        self.max_users = 10000
+        self.min_users = cfg('autoscaler', 'min_users', default=1)
+        self.max_users = cfg('autoscaler', 'max_users', default=10000)
+        self.scale_up_factor = cfg('autoscaler', 'scale_up_factor', default=1.2)
+        self.scale_down_factor = cfg('autoscaler', 'scale_down_factor', default=0.8)
+        self.consecutive_samples_required = cfg('autoscaler', 'consecutive_samples_required', default=2)
         self.scaling_history = []
         self.lock = threading.Lock()
         
@@ -2151,7 +2557,7 @@ class WorkloadAutoscaler:
             self.downward_trend_count += 1
             if self.downward_trend_count >= 2:
                 self.capacity_test_finished = True
-                print(f"INFO: Peak capacity found at {self.peak_throughput:.2f} tok/s. Stopping test.")
+                logger.info(f"Peak capacity found at {self.peak_throughput:.2f} tok/s. Stopping test.")
                 return 'stop', self.current_users
 
             return 'hold', self.current_users
@@ -2311,8 +2717,8 @@ class ValidationEngine:
 class UserSimulator:
     """Generates realistic user workloads based on pre-defined templates."""
 
-    # Templates for different user personas (chatbot, coding, document analysis).
-    USER_TEMPLATES = {
+    # Default templates for different user personas (can be overridden from config).
+    DEFAULT_USER_TEMPLATES = {
         'chatbot': {
             'context_range': (256, 1024), 'generation_range': (50, 150), 'think_time_range': (0.1, 0.5),
         },
@@ -2325,10 +2731,24 @@ class UserSimulator:
     }
 
     @classmethod
+    def _get_user_templates(cls) -> Dict:
+        """Get user templates from config, falling back to defaults."""
+        templates = {}
+        for user_type in ['chatbot', 'coding', 'document']:
+            default = cls.DEFAULT_USER_TEMPLATES[user_type]
+            templates[user_type] = {
+                'context_range': tuple(cfg('user_templates', user_type, 'context_range', default=list(default['context_range']))),
+                'generation_range': tuple(cfg('user_templates', user_type, 'generation_range', default=list(default['generation_range']))),
+                'think_time_range': tuple(cfg('user_templates', user_type, 'think_time_range', default=list(default['think_time_range']))),
+            }
+        return templates
+
+    @classmethod
     def generate_user(cls, user_id: str, user_type: str = 'chatbot', priority: int = 1,
                       qos_level: QoSLevel = QoSLevel.BATCH) -> UserProfile:
         """Generates a single user profile based on a template."""
-        template = cls.USER_TEMPLATES.get(user_type, cls.USER_TEMPLATES['chatbot'])
+        templates = cls._get_user_templates()
+        template = templates.get(user_type, templates['chatbot'])
         return UserProfile(
             user_id=user_id,
             context_length=random.randint(*template['context_range']),
@@ -2341,16 +2761,19 @@ class UserSimulator:
     @classmethod
     def generate_mixed_users(cls, num_users: int) -> List[UserProfile]:
         """Generates a list of users with a realistic distribution of types and QoS levels."""
+        # Read QoS distribution from config
+        interactive_prob = cfg('qos_distribution', 'interactive_probability', default=0.15)
+        responsive_threshold = cfg('qos_distribution', 'responsive_threshold', default=0.50)
+        
         users = []
         for i in range(num_users):
             user_type = random.choice(['chatbot', 'coding', 'document'])
 
-            # Simulate a realistic QoS distribution.
-            # 15% Interactive, 35% Responsive, 50% Batch.
+            # Simulate a realistic QoS distribution from config.
             rand = random.random()
-            if rand < 0.15:
+            if rand < interactive_prob:
                 qos_level, priority = QoSLevel.INTERACTIVE, 3
-            elif rand < 0.50:
+            elif rand < responsive_threshold:
                 qos_level, priority = QoSLevel.RESPONSIVE, 2
             else:
                 qos_level, priority = QoSLevel.BATCH, 1
@@ -2359,10 +2782,169 @@ class UserSimulator:
         return users
 
 
-# ============================================================================ 
+# ============================================================================
+# SHAREGPT DATASET LOADER
+# Loads ShareGPT conversation data for realistic workload generation.
+# ============================================================================
+
+class ShareGPTDatasetLoader:
+    """
+    Loads ShareGPT conversation data and provides realistic request patterns.
+    ShareGPT format has conversations with 'from' (human/gpt) and 'value' (text content).
+    """
+
+    def __init__(self, dataset_path: str, max_conversations: int = 1000, seed: Optional[int] = None):
+        """
+        Initialize the ShareGPT dataset loader.
+
+        Args:
+            dataset_path: Path to the ShareGPT JSON file
+            max_conversations: Maximum number of conversations to load
+            seed: Random seed for reproducibility
+        """
+        self.dataset_path = dataset_path
+        self.max_conversations = max_conversations
+        self.conversations = []
+        self.token_stats = {}
+
+        if seed:
+            random.seed(seed)
+            np.random.seed(seed)
+
+        self._load_dataset()
+
+    def _load_dataset(self):
+        """Load and process the ShareGPT dataset."""
+        if not os.path.exists(self.dataset_path):
+            logger.warning(f"Dataset not found at {self.dataset_path}")
+            return
+
+        try:
+            # Try to initialize tokenizer for accurate token counting
+            tokenizer = None
+            if TIKTOKEN_AVAILABLE:
+                try:
+                    tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
+                except Exception:
+                    pass
+
+            if tokenizer is None:
+                logger.info("Tiktoken not available, using approximate token counting")
+
+            with open(self.dataset_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # Process conversations
+            for conv_idx, conversation in enumerate(data[:self.max_conversations]):
+                if 'conversations' not in conversation:
+                    continue
+
+                conv_data = []
+                turns = conversation['conversations']
+
+                for i in range(0, len(turns) - 1, 2):  # Process pairs of human-gpt turns
+                    if i + 1 >= len(turns):
+                        break
+
+                    human_turn = turns[i]
+                    gpt_turn = turns[i + 1]
+
+                    if human_turn.get('from') != 'human' or gpt_turn.get('from') != 'gpt':
+                        continue
+
+                    # Calculate tokens
+                    context_text = human_turn.get('value', '')
+                    generation_text = gpt_turn.get('value', '')
+
+                    if tokenizer:
+                        context_tokens = len(tokenizer.encode(context_text))
+                        generation_tokens = len(tokenizer.encode(generation_text))
+                    else:
+                        # Approximate: 4 characters per token on average
+                        context_tokens = max(1, len(context_text) // 4)
+                        generation_tokens = max(1, len(generation_text) // 4)
+
+                    # Limit extreme values for stability
+                    context_tokens = min(context_tokens, 16384)  # Cap at 16K context
+                    generation_tokens = min(generation_tokens, 2048)  # Cap at 2K generation
+
+                    conv_data.append({
+                        'context_tokens': context_tokens,
+                        'generation_tokens': generation_tokens,
+                        'turn_number': i // 2 + 1
+                    })
+
+                if conv_data:
+                    self.conversations.append({
+                        'id': conversation.get('id', f'conv_{conv_idx}'),
+                        'turns': conv_data
+                    })
+
+            # Calculate statistics
+            if self.conversations:
+                all_context_tokens = []
+                all_generation_tokens = []
+
+                for conv in self.conversations:
+                    for turn in conv['turns']:
+                        all_context_tokens.append(turn['context_tokens'])
+                        all_generation_tokens.append(turn['generation_tokens'])
+
+                self.token_stats = {
+                    'context_mean': np.mean(all_context_tokens),
+                    'context_std': np.std(all_context_tokens),
+                    'context_min': np.min(all_context_tokens),
+                    'context_max': np.max(all_context_tokens),
+                    'context_p50': np.percentile(all_context_tokens, 50),
+                    'context_p95': np.percentile(all_context_tokens, 95),
+                    'generation_mean': np.mean(all_generation_tokens),
+                    'generation_std': np.std(all_generation_tokens),
+                    'generation_min': np.min(all_generation_tokens),
+                    'generation_max': np.max(all_generation_tokens),
+                    'generation_p50': np.percentile(all_generation_tokens, 50),
+                    'generation_p95': np.percentile(all_generation_tokens, 95),
+                    'total_conversations': len(self.conversations),
+                    'total_turns': sum(len(c['turns']) for c in self.conversations)
+                }
+
+                logger.info(f"Loaded {len(self.conversations)} conversations with {self.token_stats['total_turns']} turns")
+                logger.info(f"Context tokens: mean={self.token_stats['context_mean']:.1f}, p50={self.token_stats['context_p50']:.1f}, p95={self.token_stats['context_p95']:.1f}")
+                logger.info(f"Generation tokens: mean={self.token_stats['generation_mean']:.1f}, p50={self.token_stats['generation_p50']:.1f}, p95={self.token_stats['generation_p95']:.1f}")
+
+        except Exception as e:
+            logger.error(f"Error loading dataset: {e}")
+            self.conversations = []
+
+    def get_random_conversation(self) -> Optional[Dict]:
+        """Get a random conversation from the dataset."""
+        if not self.conversations:
+            return None
+        return random.choice(self.conversations)
+
+    def get_random_turn(self) -> Optional[Tuple[int, int]]:
+        """Get random context and generation token counts from the dataset."""
+        if not self.conversations:
+            return None
+
+        conv = self.get_random_conversation()
+        if conv and conv['turns']:
+            turn = random.choice(conv['turns'])
+            return turn['context_tokens'], turn['generation_tokens']
+        return None
+
+    def iterate_conversations(self, shuffle: bool = True):
+        """Iterate through all conversations, optionally shuffled."""
+        conversations = self.conversations.copy()
+        if shuffle:
+            random.shuffle(conversations)
+        for conv in conversations:
+            yield conv
+
+
+# ============================================================================
 # INTEGRATED BENCHMARK ORCHESTRATOR
 # This class wires all the components together and runs the main benchmark loop.
-# ============================================================================ 
+# ============================================================================
 
 class IntegratedBenchmark:
     """The main orchestrator for the entire benchmark."""
@@ -2386,8 +2968,12 @@ class IntegratedBenchmark:
                  performance_profile: str = 'latency',
                  use_burst_trace: bool = False,
                  burst_trace_path: Optional[str] = None,
+                 dataset_path: Optional[str] = None,
+                 max_conversations: int = 500,
                  seed: Optional[int] = None,
-                 max_concurrent_allocs: int = 0):
+                 max_concurrent_allocs: int = 0,
+                 request_rate: float = 0,
+                 max_requests: int = 0):
 
         self.model_config = model_config
         self.num_users = num_users
@@ -2403,11 +2989,28 @@ class IntegratedBenchmark:
         self.performance_profile = performance_profile
         self.use_burst_trace = use_burst_trace
         self.burst_trace_path = burst_trace_path
+        self.dataset_path = dataset_path
+        self.max_conversations = max_conversations
         self.seed = seed
         self.max_concurrent_allocs = max_concurrent_allocs
+        self.request_rate = request_rate
+        self.max_requests = max_requests
         self.burst_requests: List[Tuple[int, int]] = []
-        if self.use_burst_trace:
+        self.sharegpt_loader: Optional[ShareGPTDatasetLoader] = None
+
+        # Load dataset if provided (takes priority over burst trace)
+        if self.dataset_path:
+            self.sharegpt_loader = ShareGPTDatasetLoader(
+                dataset_path=self.dataset_path,
+                max_conversations=self.max_conversations,
+                seed=self.seed
+            )
+            self.use_dataset = True
+        elif self.use_burst_trace:
             self._load_burst_trace()
+            self.use_dataset = False
+        else:
+            self.use_dataset = False
 
         # Initialize components
         self.cache = MultiTierCache(
@@ -2451,11 +3054,12 @@ class IntegratedBenchmark:
             'seed': self.seed,
         }
         self.results_lock = threading.Lock()
+        self.stop_event: Optional[threading.Event] = None  # Set during run()
         self.rag_ingest_done = threading.Event() if self.enable_rag else None
 
     def _ingest_rag_documents(self, num_docs: int, stop_event: Optional[threading.Event] = None):
         """Ingests RAG documents for the workload."""
-        print(f"Ingesting {num_docs} RAG documents...")
+        logger.info(f"Ingesting {num_docs} RAG documents...")
         for i in range(num_docs):
             if stop_event and stop_event.is_set():
                 break
@@ -2474,7 +3078,7 @@ class IntegratedBenchmark:
     def _load_burst_trace(self):
         """Loads requests from the BurstGPT CSV trace file."""
         if not self.burst_trace_path:
-            print("Error: --use-burst-trace flag requires --burst-trace-path to be set.")
+            logger.error("--use-burst-trace flag requires --burst-trace-path to be set.")
             sys.exit(1)
         try:
             with open(self.burst_trace_path, 'r', encoding='utf-8') as f:
@@ -2486,12 +3090,12 @@ class IntegratedBenchmark:
                         self.burst_requests.append((context_tokens, generate_tokens))
                     except (ValueError, KeyError):
                         continue
-            print(f"Loaded {len(self.burst_requests)} requests from BurstGPT trace.")
+            logger.info(f"Loaded {len(self.burst_requests)} requests from BurstGPT trace.")
         except FileNotFoundError:
-            print(f"Error: Trace file not found at {self.burst_trace_path}")
+            logger.error(f"Trace file not found at {self.burst_trace_path}")
             sys.exit(1)
         except Exception as e:
-            print(f"Error reading trace file: {e}")
+            logger.error(f"Error reading trace file: {e}")
             sys.exit(1)
 
     def _generate_requests_from_trace(self, stop_event: threading.Event):
@@ -2499,7 +3103,7 @@ class IntegratedBenchmark:
         request_index = 0
         while not stop_event.is_set():
             if not self.burst_requests:
-                print("Warning: BurstGPT trace is empty. No requests to generate.")
+                logger.warning("BurstGPT trace is empty. No requests to generate.")
                 time.sleep(1)
                 continue
 
@@ -2540,9 +3144,82 @@ class IntegratedBenchmark:
 
             priority_tuple = (-QOS_PROFILES[request.qos_level].priority, time.time())
             self.request_queue.put((priority_tuple, request))
-            
+
             request_index += 1
             time.sleep(0.01) # Simulate request arrival rate
+
+    def _generate_requests_from_dataset(self, stop_event: threading.Event):
+        """Generates InferenceRequest objects from the loaded ShareGPT dataset."""
+        if not self.sharegpt_loader or not self.sharegpt_loader.conversations:
+            logger.warning("ShareGPT dataset is empty or not loaded. Falling back to synthetic workload.")
+            # Fall back to synthetic generation
+            users = UserSimulator.generate_mixed_users(self.num_users)
+            self.generate_requests(users, stop_event)
+            return
+
+        conversation_iterator = iter(self.sharegpt_loader.iterate_conversations(shuffle=True))
+        current_conversation = None
+        turn_index = 0
+
+        while not stop_event.is_set():
+            # Get next conversation turn
+            if current_conversation is None or turn_index >= len(current_conversation['turns']):
+                try:
+                    current_conversation = next(conversation_iterator)
+                    turn_index = 0
+                except StopIteration:
+                    # Restart iteration when we run out of conversations
+                    conversation_iterator = iter(self.sharegpt_loader.iterate_conversations(shuffle=True))
+                    continue
+
+            turn = current_conversation['turns'][turn_index]
+            context_tokens = turn['context_tokens']
+            generate_tokens = turn['generation_tokens']
+
+            with self.counter_lock:
+                req_id = self.request_counter
+                self.request_counter += 1
+
+            # Assign QoS level based on request characteristics (from config)
+            interactive_prob = cfg('qos_distribution', 'interactive_probability', default=0.15)
+            responsive_threshold = cfg('qos_distribution', 'responsive_threshold', default=0.50)
+            
+            rand = random.random()
+            if rand < interactive_prob:
+                qos_level, priority = QoSLevel.INTERACTIVE, 3
+            elif rand < responsive_threshold:
+                qos_level, priority = QoSLevel.RESPONSIVE, 2
+            else:
+                qos_level, priority = QoSLevel.BATCH, 1
+
+            user_id = f"dataset_user_{req_id % self.num_users}"
+            conv_id = current_conversation['id']
+
+            # Determine inference phase
+            phase = InferencePhase.PREFILL if context_tokens >= 10000 else InferencePhase.PREFILL_DECODE
+
+            request = InferenceRequest(
+                user_id=user_id,
+                request_id=f"{user_id}_req_{req_id:04d}",
+                timestamp=datetime.now(),
+                context_tokens=context_tokens,
+                generate_tokens=generate_tokens,
+                priority=priority,
+                phase=phase,
+                qos_level=qos_level,
+                cache_key=f"{conv_id}_turn_{turn['turn_number']}",
+                conversation_id=conv_id if self.enable_multi_turn else None,
+                turn_number=turn['turn_number'] if self.enable_multi_turn else None
+            )
+
+            priority_tuple = (-QOS_PROFILES[request.qos_level].priority, time.time())
+            self.request_queue.put((priority_tuple, request))
+
+            turn_index += 1
+
+            # Control request arrival rate (0 = unlimited for storage saturation)
+            if self.request_rate > 0:
+                time.sleep(1.0 / self.request_rate)
 
     def generate_requests(self, users: List[UserProfile], stop_event: threading.Event):
         """Generate requests concurrently for each simulated user."""
@@ -2690,13 +3367,15 @@ class IntegratedBenchmark:
                 with self.results_lock: self.results['prefill_latencies'].append(write_latency)
 
             # 4. Simulate a RAG operation by reading random chunk caches.
-            # NOTE: Check that documents exist to avoid race condition with RAG ingestion thread
-            if self.rag_manager and self.rag_manager.documents and random.random() < 0.1: # 10% of requests are RAG queries
-                doc_id = random.choice(list(self.rag_manager.documents.keys()))
-                chunks = self.rag_manager.retrieve_chunks(doc_id)
-                for chunk in chunks: # Read the KV cache for each retrieved chunk.
-                    _, read_lat = self.cache.access_cache(chunk.kv_cache_key, InferencePhase.DECODE)
-                    storage_latency += read_lat
+            # NOTE: Capture document keys atomically to avoid race condition with RAG ingestion thread
+            if self.rag_manager and random.random() < 0.1:  # 10% of requests are RAG queries
+                doc_keys = list(self.rag_manager.documents.keys()) if self.rag_manager.documents else []
+                if doc_keys:
+                    doc_id = random.choice(doc_keys)
+                    chunks = self.rag_manager.retrieve_chunks(doc_id)
+                    for chunk in chunks:  # Read the KV cache for each retrieved chunk.
+                        _, read_lat = self.cache.access_cache(chunk.kv_cache_key, InferencePhase.DECODE)
+                        storage_latency += read_lat
 
             # 5. Perform the DECODE operation (a cache READ).
             if request.phase == InferencePhase.DECODE or request.phase == InferencePhase.PREFILL_DECODE:
@@ -2711,7 +3390,7 @@ class IntegratedBenchmark:
                     storage_latency += write_latency
                 else:
                     # Simulate realistic decode I/O: reads are batched, not per-token.
-                    decode_batch_size = 32
+                    decode_batch_size = cfg('decode', 'batch_size', default=32)
                     num_batched_reads = max(1, (request.generate_tokens + decode_batch_size - 1) // decode_batch_size)
                     for _ in range(num_batched_reads):
                         _, batch_read_latency = self.cache.access_cache(request.cache_key, InferencePhase.DECODE, cache_type)
@@ -2734,6 +3413,11 @@ class IntegratedBenchmark:
                 self.results['end_to_end_latencies'].append(request.total_latency_ms / 1000)
                 self.results['storage_latencies'].append(storage_latency)
                 self.results['generation_latencies'].append(generation_latency)
+
+                # Check if we've hit max_requests limit
+                if self.max_requests > 0 and self.results['requests_completed'] >= self.max_requests:
+                    if self.stop_event:
+                        self.stop_event.set()
 
             self.qos_monitor.record_request(request)
 
@@ -2786,9 +3470,9 @@ class IntegratedBenchmark:
                         'throughput_tokens_per_sec': throughput
                     }
                     self.autoscaler.scaling_history.append(log_entry)
-                    print(f"Autoscaler {action} -> {self.num_users} users (saturation: {saturation_level:.2f})")
+                    logger.info(f"Autoscaler {action} -> {self.num_users} users (saturation: {saturation_level:.2f})")
                 elif action == 'stop':
-                    print("Autoscaler requested stop after reaching capacity peak.")
+                    logger.info("Autoscaler requested stop after reaching capacity peak.")
                     stop_event.set()
                     log_entry = {
                         'timestamp': datetime.now().isoformat(),
@@ -2807,7 +3491,7 @@ class IntegratedBenchmark:
             if now - last_log_time >= 10:
                 self._calculate_stats()
                 queue_depth = self.request_queue.qsize()
-                print(f"Time: {int(elapsed)}s, Users: {self.num_users}, Queue: {queue_depth}, "
+                logger.info(f"Time: {int(elapsed)}s, Users: {self.num_users}, Queue: {queue_depth}, "
                       f"Throughput: {throughput:.2f} tok/s")
                 last_log_time = now
 
@@ -2830,12 +3514,13 @@ class IntegratedBenchmark:
             print(f"    - Mode: {self.autoscaler.mode}")
         print(f"  - QoS Support: Enabled (Interactive/Responsive/Batch)")
         print(f"  - Trace-Driven (BurstGPT): {'Enabled' if self.use_burst_trace else 'Disabled'}")
+        print(f"  - ShareGPT Dataset: {'Enabled' if self.use_dataset else 'Disabled'}")
         if self.max_concurrent_allocs > 0:
             print(f"  - Max Concurrent Allocations: {self.max_concurrent_allocs} (bounds RAM usage)")
         print("=" * 80)
 
         users = []
-        if not self.use_burst_trace:
+        if not self.use_burst_trace and not self.use_dataset:
             users = UserSimulator.generate_mixed_users(self.num_users)
             context_lengths = [u.context_length for u in users]
             print(f"\nUser Context Length Distribution:")
@@ -2847,14 +3532,21 @@ class IntegratedBenchmark:
             print(f"\nQoS Distribution:")
             for level, count in qos_dist.items():
                 print(f"  {level.value}: {count} users")
+        elif self.use_dataset and self.sharegpt_loader:
+            print(f"\nShareGPT Dataset Statistics:")
+            print(f"  Conversations: {self.sharegpt_loader.token_stats.get('total_conversations', 0)}")
+            print(f"  Total Turns: {self.sharegpt_loader.token_stats.get('total_turns', 0)}")
 
         print(f"\nStarting benchmark...")
         print("-" * 80)
 
         stop_event = threading.Event()
+        self.stop_event = stop_event  # Store for max_requests check
 
         threads = []
-        if self.use_burst_trace:
+        if self.use_dataset:
+            gen_thread = threading.Thread(target=self._generate_requests_from_dataset, args=(stop_event,), daemon=True)
+        elif self.use_burst_trace:
             gen_thread = threading.Thread(target=self._generate_requests_from_trace, args=(stop_event,), daemon=True)
         else:
             gen_thread = threading.Thread(target=self.generate_requests, args=(users, stop_event), daemon=True)
@@ -2874,31 +3566,36 @@ class IntegratedBenchmark:
             threads.append(mon_thread)
             mon_thread.start()
 
-        # Wait for either the configured duration or an earlier stop signal from the monitor.
+        # Wait for either the configured duration or an earlier stop signal (from max_requests or monitor).
+        benchmark_start = time.time()
         stop_event.wait(timeout=self.duration)
+        actual_duration = time.time() - benchmark_start
 
         stop_event.set()
         for thread in threads:
             thread.join(timeout=2.0)
 
-        self._calculate_stats()
+        self._calculate_stats(actual_duration)
 
         if self.validator:
             self.results['validation'] = self.validator.validate_benchmark(self.results)
 
         return self.results
 
-    def _calculate_stats(self):
+    def _calculate_stats(self, actual_duration: float = None):
         """Calculate final statistics with all feature breakdowns"""
         if not self.results['end_to_end_latencies']:
-            print("\nNo requests completed during benchmark!")
+            logger.warning("No requests completed during benchmark!")
             return
+
+        # Use actual duration if provided (for max_requests mode), else configured duration
+        duration = actual_duration if actual_duration else self.duration
 
         e2e = np.array(self.results['end_to_end_latencies'])
         storage = np.array(self.results['storage_latencies'])
         generation = np.array(self.results['generation_latencies'])
 
-        cache_stats = self.cache.get_stats(self.duration)
+        cache_stats = self.cache.get_stats(duration)
         qos_metrics = self.qos_monitor.get_all_qos_metrics()
         prefix_stats = self.prefix_cache_manager.stats if self.prefix_cache_manager else {}
         autoscaling_stats = self.autoscaler.scaling_history if self.autoscaler else []
@@ -2919,25 +3616,34 @@ class IntegratedBenchmark:
         summary = {
             'total_requests': self.results['requests_completed'],
             'total_tokens': self.results['total_tokens_generated'],
-            'avg_throughput_tokens_per_sec': self.results['total_tokens_generated'] / self.duration,
-            'requests_per_second': self.results['requests_completed'] / self.duration,
+            'elapsed_time': duration,
+            'avg_throughput_tokens_per_sec': self.results['total_tokens_generated'] / duration,
+            'total_storage_io_time': self.results['total_storage_io_latency'],
+            'storage_throughput_tokens_per_sec': self.results['total_tokens_generated'] / self.results['total_storage_io_latency'] if self.results['total_storage_io_latency'] > 0 else 0,
+            'requests_per_second': self.results['requests_completed'] / duration,
             'end_to_end_latency_ms': {
                 'mean': np.mean(e2e) * 1000,
                 'p50': np.percentile(e2e, 50) * 1000,
                 'p95': np.percentile(e2e, 95) * 1000,
                 'p99': np.percentile(e2e, 99) * 1000,
+                'p999': np.percentile(e2e, 99.9) * 1000,
+                'p9999': np.percentile(e2e, 99.99) * 1000,
             },
             'storage_io_latency_ms': {
                 'mean': np.mean(storage) * 1000,
                 'p50': np.percentile(storage, 50) * 1000,
                 'p95': np.percentile(storage, 95) * 1000,
                 'p99': np.percentile(storage, 99) * 1000,
+                'p999': np.percentile(storage, 99.9) * 1000,
+                'p9999': np.percentile(storage, 99.99) * 1000,
             },
             'generation_latency_ms': {
                 'mean': np.mean(generation) * 1000,
                 'p50': np.percentile(generation, 50) * 1000,
                 'p95': np.percentile(generation, 95) * 1000,
                 'p99': np.percentile(generation, 99) * 1000,
+                'p999': np.percentile(generation, 99.9) * 1000,
+                'p9999': np.percentile(generation, 99.99) * 1000,
             },
             'cache_stats': cache_stats,
             'qos_metrics': qos_metrics,
@@ -2982,10 +3688,6 @@ class IntegratedBenchmark:
             - Phase-specific metrics (prefill/decode)
             - QoS compliance by service tier
             - Validation results if available
-        Note:
-            The symbols âœ" and âœ— are intended to be checkmark (✓) and cross (✗) 
-            characters for pass/fail indicators but may display incorrectly due to 
-            encoding issues.
         """
         """Print comprehensive results summary"""
         print("\n" + "=" * 80)
@@ -2993,15 +3695,19 @@ class IntegratedBenchmark:
         print(f"Generation Mode: {self.generation_mode.value} ({self.ms_per_token:.1f}ms/token)")
         print("=" * 80)
 
+        # Use ASCII-safe symbols for pass/fail indicators
+        PASS_SYMBOL = "[OK]"
+        FAIL_SYMBOL = "[X]"
+
         cache_stats = summary['cache_stats']
         if 'storage_health' in cache_stats:
             storage_health = cache_stats['storage_health']
             status = storage_health['overall_status']
-            status_symbol = 'âœ“' if status == 'PASS' else 'âœ—'
+            status_symbol = PASS_SYMBOL if status == 'PASS' else FAIL_SYMBOL
             print(f"\n### STORAGE PERFORMANCE ASSESSMENT: {status} {status_symbol} ###")
             print(f"  Criteria Passed: {storage_health['passed_count']}/{storage_health['total_count']}")
             for criterion in storage_health['criteria']:
-                symbol = 'âœ“' if criterion['passed'] else 'âœ—'
+                symbol = PASS_SYMBOL if criterion['passed'] else FAIL_SYMBOL
                 unit = criterion.get('unit', '')
                 if unit == 'ratio':
                     print(f"  {symbol} {criterion['name']}: {criterion['actual']:.1%} (target: {criterion['target']:.1%})")
@@ -3027,20 +3733,22 @@ class IntegratedBenchmark:
         print(f"\n### OVERALL PERFORMANCE ###")
         print(f"Requests Completed: {summary['total_requests']}")
         print(f"Total Tokens Generated: {summary['total_tokens']}")
-        print(f"Throughput: {summary['avg_throughput_tokens_per_sec']:.2f} tokens/sec")
+        print(f"Throughput (wall-clock): {summary['avg_throughput_tokens_per_sec']:.2f} tokens/sec")
+        print(f"Throughput (storage I/O): {summary['storage_throughput_tokens_per_sec']:.2f} tokens/sec")
         print(f"Requests/sec: {summary['requests_per_second']:.2f}")
 
-        print(f"\n### END-TO-END LATENCY (Storage I/O + Token Generation) ###")
+        print(f"\n### END-TO-END LATENCY (Queue Wait + Storage I/O + Generation) ###")
         print(f"  Mean: {summary['end_to_end_latency_ms']['mean']:.2f} ms")
         print(f"  P50:  {summary['end_to_end_latency_ms']['p50']:.2f} ms")
         print(f"  P95:  {summary['end_to_end_latency_ms']['p95']:.2f} ms")
         print(f"  P99:  {summary['end_to_end_latency_ms']['p99']:.2f} ms")
 
-        print(f"\n### STORAGE I/O LATENCY (Primary Metric) ###")
+        print(f"\n### PER-REQUEST STORAGE LATENCY (All I/O ops for one request) ###")
         print(f"  Mean: {summary['storage_io_latency_ms']['mean']:.2f} ms")
         print(f"  P50:  {summary['storage_io_latency_ms']['p50']:.2f} ms")
         print(f"  P95:  {summary['storage_io_latency_ms']['p95']:.2f} ms")
         print(f"  P99:  {summary['storage_io_latency_ms']['p99']:.2f} ms")
+        print(f"  (= 1 prefill write + N decode reads per request)")
 
         if self.generation_mode != GenerationMode.NONE:
             print(f"\n### TOKEN GENERATION LATENCY (Simulated @ {self.ms_per_token:.1f}ms/token) ###")
@@ -3059,20 +3767,46 @@ class IntegratedBenchmark:
         print(f"\n### CACHE TIER DISTRIBUTION ###")
         print(f"  GPU Entries: {cache_stats['gpu_entries']} ({cache_stats['gpu_memory_used_gb']:.2f} GB)")
         print(f"  CPU Entries: {cache_stats['cpu_entries']} ({cache_stats['cpu_memory_used_gb']:.2f} GB)")
-        print(f"  NVMe Entries: {cache_stats['nvme_entries']}")
+        print(f"  Storage Entries: {cache_stats['storage_entries']}")
 
-        print(f"\n### PHASE-SPECIFIC METRICS ###")
-        print(f"  Prefill Writes: {cache_stats['prefill_writes']}")
-        print(f"  Prefill Bytes Written: {cache_stats['prefill_bytes_written_gb']:.2f} GB")
-        print(f"  Decode Reads: {cache_stats['decode_reads']}")
-        print(f"  Decode Bytes Read: {cache_stats['decode_bytes_read_gb']:.2f} GB")
+        print(f"\n### TIER-SPECIFIC KV BYTES ###")
+        # GPU tier
+        if cache_stats.get('tier_gpu_kv_bytes_written_gb', 0) > 0:
+            print(f"  GPU KV Bytes Written: {cache_stats['tier_gpu_kv_bytes_written_gb']:.2f} GB")
+        if cache_stats.get('tier_gpu_kv_bytes_read_gb', 0) > 0:
+            print(f"  GPU KV Bytes Read: {cache_stats['tier_gpu_kv_bytes_read_gb']:.2f} GB")
+        # CPU tier
+        if cache_stats.get('tier_cpu_kv_bytes_written_gb', 0) > 0:
+            print(f"  CPU KV Bytes Written: {cache_stats['tier_cpu_kv_bytes_written_gb']:.2f} GB")
+        if cache_stats.get('tier_cpu_kv_bytes_read_gb', 0) > 0:
+            print(f"  CPU KV Bytes Read: {cache_stats['tier_cpu_kv_bytes_read_gb']:.2f} GB")
+        # Storage tier
+        if cache_stats.get('tier_storage_kv_bytes_written_gb', 0) > 0:
+            print(f"  Storage KV Bytes Written: {cache_stats['tier_storage_kv_bytes_written_gb']:.2f} GB")
+        if cache_stats.get('tier_storage_kv_bytes_read_gb', 0) > 0:
+            print(f"  Storage KV Bytes Read: {cache_stats['tier_storage_kv_bytes_read_gb']:.2f} GB")
 
-        print(f"\n### TIER-SPECIFIC LATENCIES ###")
-        for tier in ['gpu', 'cpu', 'nvme']:
+        print(f"\n### TIER-SPECIFIC LATENCIES (Total = Host + Device) ###")
+        for tier in ['gpu', 'cpu', 'storage']:
             for op in ['read', 'write']:
                 p95_key = f'{tier}_{op}_p95_ms'
                 if p95_key in cache_stats:
-                    print(f"  {tier.upper()} {op.title()} P95: {cache_stats[p95_key]:.2f} ms")
+                    tier_label = 'Storage' if tier == 'storage' else tier.upper()
+                    print(f"  {tier_label} {op.title()} P95 (Total): {cache_stats[p95_key]:.2f} ms")
+
+        # Storage tier Device vs Host latency breakdown (most important for storage benchmarks)
+        print(f"\n### STORAGE TIER LATENCY BREAKDOWN (Device = Disk I/O, Host = Serialization) ###")
+        for op in ['read', 'write']:
+            device_key = f'storage_{op}_device_p95_ms'
+            host_key = f'storage_{op}_host_p95_ms'
+            total_key = f'storage_{op}_p95_ms'
+            if device_key in cache_stats:
+                print(f"  Storage {op.title()}:")
+                print(f"    - Device P95 (Disk I/O): {cache_stats[device_key]:.2f} ms")
+                if host_key in cache_stats:
+                    print(f"    - Host P95 (Serialization): {cache_stats[host_key]:.2f} ms")
+                if total_key in cache_stats:
+                    print(f"    - Total P95: {cache_stats[total_key]:.2f} ms")
 
         print(f"\n### CACHE TYPE BREAKDOWNS ###")
         print(f"  System Prompt Hits: {cache_stats['system_prompt_hits']}")
@@ -3104,7 +3838,7 @@ class IntegratedBenchmark:
             print(f"    Latency P95: {metrics['latency_ms']['p95']:.2f} ms")
             print(f"    Latency P99: {metrics['latency_ms']['p99']:.2f} ms")
             if 'sla' in metrics:
-                sla_met = 'âœ“' if metrics['sla']['met'] else 'âœ—'
+                sla_met = '[OK]' if metrics['sla']['met'] else '[X]'
                 print(f"    SLA Met: {sla_met} (compliance: {metrics['sla']['compliance']:.1%})")
 
         if summary.get('autoscaling_stats'):
@@ -3119,7 +3853,7 @@ class IntegratedBenchmark:
         if 'validation' in self.results:
             print(f"\n### VALIDATION ###")
             validation = self.results['validation']
-            print(f"  Validation: {'PASSED âœ“' if validation['passed'] else 'FAILED âœ—'}")
+            print(f"  Validation: {'PASSED [OK]' if validation['passed'] else 'FAILED [X]'}")
             print(f"  Average Error: {validation['avg_error_pct']:.2f}%")
 
         print("\n" + "=" * 80)
@@ -3131,9 +3865,112 @@ class IntegratedBenchmark:
         print("=" * 80)
 
 
+# ============================================================================
+# INPUT VALIDATION
+# Validates command-line arguments before benchmark execution.
+# ============================================================================
+
+# Validation constants with documented rationale
+MAX_USERS = 100000          # Reasonable upper limit for simulated users
+MAX_DURATION_SECONDS = 86400  # 24 hours - prevents runaway benchmarks
+MAX_GPU_MEMORY_GB = 1024    # 1TB - covers even the largest GPU clusters
+MAX_CPU_MEMORY_GB = 16384   # 16TB - covers high-memory server configurations
+
+# System directories that should never be used as cache directories
+FORBIDDEN_CACHE_PREFIXES = frozenset([
+    '/etc', '/bin', '/sbin', '/usr/bin', '/usr/sbin',
+    '/boot', '/sys', '/proc', '/dev', '/root'
+])
+
+
+def validate_args(args: argparse.Namespace) -> argparse.Namespace:
+    """
+    Validate command-line arguments to catch invalid values early.
+
+    Args:
+        args: Parsed argparse namespace
+
+    Returns:
+        The validated args namespace
+
+    Raises:
+        ValueError: If any validation check fails
+    """
+    errors = []
+
+    # Validate positive integers
+    if args.num_users <= 0:
+        errors.append(f"--num-users must be positive, got {args.num_users}")
+    if args.num_users > MAX_USERS:
+        errors.append(f"--num-users exceeds limit ({MAX_USERS}), got {args.num_users}")
+
+    if args.duration <= 0:
+        errors.append(f"--duration must be positive, got {args.duration}")
+    if args.duration > MAX_DURATION_SECONDS:
+        errors.append(f"--duration exceeds 24 hours ({MAX_DURATION_SECONDS}s), got {args.duration}")
+
+    # Validate memory sizes
+    if args.gpu_mem_gb < 0:
+        errors.append(f"--gpu-mem-gb cannot be negative, got {args.gpu_mem_gb}")
+    if args.gpu_mem_gb > MAX_GPU_MEMORY_GB:
+        errors.append(f"--gpu-mem-gb exceeds limit ({MAX_GPU_MEMORY_GB}GB), got {args.gpu_mem_gb}")
+
+    if args.cpu_mem_gb < 0:
+        errors.append(f"--cpu-mem-gb cannot be negative, got {args.cpu_mem_gb}")
+    if args.cpu_mem_gb > MAX_CPU_MEMORY_GB:
+        errors.append(f"--cpu-mem-gb exceeds limit ({MAX_CPU_MEMORY_GB}GB), got {args.cpu_mem_gb}")
+
+    # Validate optional integers
+    if args.rag_num_docs < 0:
+        errors.append(f"--rag-num-docs cannot be negative, got {args.rag_num_docs}")
+
+    if args.max_conversations <= 0:
+        errors.append(f"--max-conversations must be positive, got {args.max_conversations}")
+
+    if args.max_concurrent_allocs < 0:
+        errors.append(f"--max-concurrent-allocs cannot be negative, got {args.max_concurrent_allocs}")
+
+    if args.request_rate < 0:
+        errors.append(f"--request-rate cannot be negative, got {args.request_rate}")
+
+    if args.max_requests < 0:
+        errors.append(f"--max-requests cannot be negative, got {args.max_requests}")
+
+    # Validate target_saturation range
+    if not (0.0 <= args.target_saturation <= 1.0):
+        errors.append(f"--target-saturation must be between 0.0 and 1.0, got {args.target_saturation}")
+
+    # Validate cache directory if provided
+    if args.cache_dir:
+        # Resolve symlinks to prevent bypass attacks
+        cache_path = Path(args.cache_dir).resolve()
+        cache_path_str = str(cache_path)
+
+        # Check for forbidden system directories
+        for prefix in FORBIDDEN_CACHE_PREFIXES:
+            if cache_path_str.startswith(prefix):
+                errors.append(f"--cache-dir cannot be a system directory: {cache_path}")
+                break
+
+        # Check if parent directory is writable (if it exists)
+        parent = cache_path.parent
+        if parent.exists() and not os.access(parent, os.W_OK):
+            errors.append(f"--cache-dir parent is not writable: {parent}")
+
+    if errors:
+        for error in errors:
+            logger.error(f"Validation error: {error}")
+        raise ValueError(f"Invalid arguments:\n  " + "\n  ".join(errors))
+
+    return args
+
+
 def main():
     """Main entry point for running the benchmark from the command line."""
     parser = argparse.ArgumentParser(description="Integrated Multi-User KV Cache Benchmark")
+    parser.add_argument('--log-level', type=str, default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        help='Set the logging level (default: INFO)')
     parser.add_argument('--model', type=str, default='llama3.1-8b', choices=MODEL_CONFIGS.keys(),
                         help='The model configuration to use.')
     parser.add_argument('--num-users', type=int, default=100,
@@ -3168,17 +4005,53 @@ def main():
                         help='Path to the BurstGPT trace file.')
     parser.add_argument('--validation-trace', type=str, default=None,
                         help='Path to a real-world trace file for validation.')
+    parser.add_argument('--dataset-path', type=str, default=None,
+                        help='Path to ShareGPT dataset JSON file for realistic workload generation.')
+    parser.add_argument('--max-conversations', type=int, default=500,
+                        help='Maximum number of conversations to load from the ShareGPT dataset.')
     parser.add_argument('--output', type=str, default=f"benchmark_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", help='Output file for results')
     parser.add_argument('--seed', type=int, default=None,
                         help='Seed for random number generators to ensure reproducibility.')
     parser.add_argument('--max-concurrent-allocs', type=int, default=0,
                         help='Limit concurrent allocations to bound RAM usage. 0 = unlimited. '
                              'Recommended: 8-16 for large models to prevent memory explosion.')
+    parser.add_argument('--request-rate', type=float, default=0,
+                        help='Target request arrival rate for ShareGPT replay (requests/sec). '
+                             '0 = unlimited (storage-saturating mode for MLPerf). '
+                             'Default: 0. Use 10 for realistic user arrival patterns.')
+    parser.add_argument('--max-requests', type=int, default=0,
+                        help='Stop after completing N requests (0 = use duration instead). '
+                             'Useful for fixed-workload comparisons with vLLM benchmarks.')
+    parser.add_argument('--xlsx-output', type=str, default=None,
+                        help='Optional: Output Excel file path for summary results with run parameters. '
+                             'Requires pandas and openpyxl. Falls back to CSV if openpyxl not available.')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to YAML configuration file. Overrides hardcoded defaults.')
 
     args = parser.parse_args()
 
+    # Configure logging based on command-line argument
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Validate command-line arguments
+    args = validate_args(args)
+
+    # Load YAML config if provided
+    if args.config:
+        config = ConfigLoader(args.config)
+        set_config(config)
+        logger.info(f"Loaded configuration from {args.config}")
+        
+        # Refresh QOS_PROFILES with config values
+        global QOS_PROFILES
+        QOS_PROFILES = get_qos_profiles()
+
     if args.seed is not None:
-        print(f"Using random seed: {args.seed}")
+        logger.info(f"Using random seed: {args.seed}")
         random.seed(args.seed)
         np.random.seed(args.seed)
         if TORCH_AVAILABLE:
@@ -3208,8 +4081,12 @@ def main():
         performance_profile=args.performance_profile,
         use_burst_trace=args.use_burst_trace,
         burst_trace_path=args.burst_trace_path,
+        dataset_path=args.dataset_path,
+        max_conversations=args.max_conversations,
         seed=args.seed,
-        max_concurrent_allocs=args.max_concurrent_allocs
+        max_concurrent_allocs=args.max_concurrent_allocs,
+        request_rate=args.request_rate,
+        max_requests=args.max_requests
     )
 
     results = benchmark.run()
@@ -3229,7 +4106,224 @@ def main():
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=4, default=convert_numpy)
 
-    print(f"\nResults saved to {args.output}")
+    logger.info(f"Results saved to {args.output}")
+
+    # Export to XLSX if requested
+    if args.xlsx_output:
+        export_results_to_xlsx(results, args, args.xlsx_output)
+
+
+def export_results_to_xlsx(results: Dict, args, output_path: str):
+    """
+    Export benchmark results to an Excel file with run parameters embedded.
+    Falls back to CSV if openpyxl is not available.
+    
+    Args:
+        results: The benchmark results dictionary
+        args: The argparse namespace with all CLI parameters
+        output_path: Path for the output Excel/CSV file
+    """
+    if not PANDAS_AVAILABLE:
+        logger.warning("pandas not available, skipping XLSX export. Install with: pip install pandas")
+        return
+    
+    summary = results.get('summary', {})
+    if not summary:
+        logger.warning("No summary data available for XLSX export")
+        return
+    
+    # Helper to safely get nested keys
+    def get_nested(d, keys, default=None):
+        for key in keys:
+            if isinstance(d, dict):
+                d = d.get(key, default)
+            else:
+                return default
+        return d
+    
+    # Build run parameters row
+    run_params = {
+        'Timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'Model': args.model,
+        'Num Users': args.num_users,
+        'Duration (s)': args.duration,
+        'GPU Memory (GB)': args.gpu_mem_gb,
+        'CPU Memory (GB)': args.cpu_mem_gb,
+        'Generation Mode': args.generation_mode,
+        'Performance Profile': args.performance_profile,
+        'Multi-turn': not args.disable_multi_turn,
+        'Prefix Caching': not args.disable_prefix_caching,
+        'RAG Enabled': args.enable_rag,
+        'Autoscaling': args.enable_autoscaling,
+        'Seed': args.seed,
+        'Max Concurrent Allocs': args.max_concurrent_allocs,
+        'Request Rate': args.request_rate,
+        'Max Requests': args.max_requests,
+        'Dataset Path': args.dataset_path or 'N/A',
+        'Cache Dir': args.cache_dir or 'temp',
+    }
+    
+    # Build metrics row
+    metrics = {
+        'Total Requests': summary.get('total_requests'),
+        'Total Tokens': summary.get('total_tokens'),
+        'Elapsed Time (s)': summary.get('elapsed_time'),
+        'Avg Throughput (tok/s)': summary.get('avg_throughput_tokens_per_sec'),
+        'Storage Throughput (tok/s)': summary.get('storage_throughput_tokens_per_sec'),
+        'Requests/sec': summary.get('requests_per_second'),
+        
+        # End to End Latency
+        'E2E Latency Mean (ms)': get_nested(summary, ['end_to_end_latency_ms', 'mean']),
+        'E2E Latency P50 (ms)': get_nested(summary, ['end_to_end_latency_ms', 'p50']),
+        'E2E Latency P95 (ms)': get_nested(summary, ['end_to_end_latency_ms', 'p95']),
+        'E2E Latency P99 (ms)': get_nested(summary, ['end_to_end_latency_ms', 'p99']),
+        'E2E Latency P99.9 (ms)': get_nested(summary, ['end_to_end_latency_ms', 'p999']),
+        'E2E Latency P99.99 (ms)': get_nested(summary, ['end_to_end_latency_ms', 'p9999']),
+        
+        # Storage IO Latency
+        'Storage Latency Mean (ms)': get_nested(summary, ['storage_io_latency_ms', 'mean']),
+        'Storage Latency P50 (ms)': get_nested(summary, ['storage_io_latency_ms', 'p50']),
+        'Storage Latency P95 (ms)': get_nested(summary, ['storage_io_latency_ms', 'p95']),
+        'Storage Latency P99 (ms)': get_nested(summary, ['storage_io_latency_ms', 'p99']),
+        'Storage Latency P99.9 (ms)': get_nested(summary, ['storage_io_latency_ms', 'p999']),
+        'Storage Latency P99.99 (ms)': get_nested(summary, ['storage_io_latency_ms', 'p9999']),
+        
+        # Generation Latency (simulated GPU work)
+        'Gen Latency Mean (ms)': get_nested(summary, ['generation_latency_ms', 'mean']),
+        'Gen Latency P50 (ms)': get_nested(summary, ['generation_latency_ms', 'p50']),
+        'Gen Latency P95 (ms)': get_nested(summary, ['generation_latency_ms', 'p95']),
+        'Gen Latency P99 (ms)': get_nested(summary, ['generation_latency_ms', 'p99']),
+
+        # Storage Tier Total Latency (Host serialization + Device I/O)
+        'Storage Tier Read Total P50 (ms)': get_nested(summary, ['cache_stats', 'storage_read_p50_ms']),
+        'Storage Tier Read Total P95 (ms)': get_nested(summary, ['cache_stats', 'storage_read_p95_ms']),
+        'Storage Tier Read Total P99 (ms)': get_nested(summary, ['cache_stats', 'storage_read_p99_ms']),
+        'Storage Tier Read Total P99.9 (ms)': get_nested(summary, ['cache_stats', 'storage_read_p999_ms']),
+        'Storage Tier Read Total P99.99 (ms)': get_nested(summary, ['cache_stats', 'storage_read_p9999_ms']),
+        'Storage Tier Write Total P50 (ms)': get_nested(summary, ['cache_stats', 'storage_write_p50_ms']),
+        'Storage Tier Write Total P95 (ms)': get_nested(summary, ['cache_stats', 'storage_write_p95_ms']),
+        'Storage Tier Write Total P99 (ms)': get_nested(summary, ['cache_stats', 'storage_write_p99_ms']),
+        'Storage Tier Write Total P99.9 (ms)': get_nested(summary, ['cache_stats', 'storage_write_p999_ms']),
+        'Storage Tier Write Total P99.99 (ms)': get_nested(summary, ['cache_stats', 'storage_write_p9999_ms']),
+
+        # Storage Tier Device Latency (actual disk I/O - fsync for writes, np.load for reads)
+        'Storage Tier Read Device P50 (ms)': get_nested(summary, ['cache_stats', 'storage_read_device_p50_ms']),
+        'Storage Tier Read Device P95 (ms)': get_nested(summary, ['cache_stats', 'storage_read_device_p95_ms']),
+        'Storage Tier Read Device P99 (ms)': get_nested(summary, ['cache_stats', 'storage_read_device_p99_ms']),
+        'Storage Tier Read Device P99.9 (ms)': get_nested(summary, ['cache_stats', 'storage_read_device_p999_ms']),
+        'Storage Tier Read Device P99.99 (ms)': get_nested(summary, ['cache_stats', 'storage_read_device_p9999_ms']),
+        'Storage Tier Write Device P50 (ms)': get_nested(summary, ['cache_stats', 'storage_write_device_p50_ms']),
+        'Storage Tier Write Device P95 (ms)': get_nested(summary, ['cache_stats', 'storage_write_device_p95_ms']),
+        'Storage Tier Write Device P99 (ms)': get_nested(summary, ['cache_stats', 'storage_write_device_p99_ms']),
+        'Storage Tier Write Device P99.9 (ms)': get_nested(summary, ['cache_stats', 'storage_write_device_p999_ms']),
+        'Storage Tier Write Device P99.99 (ms)': get_nested(summary, ['cache_stats', 'storage_write_device_p9999_ms']),
+
+        # Storage Tier Host Latency (serialization/deserialization - CPU work)
+        'Storage Tier Read Host P50 (ms)': get_nested(summary, ['cache_stats', 'storage_read_host_p50_ms']),
+        'Storage Tier Read Host P95 (ms)': get_nested(summary, ['cache_stats', 'storage_read_host_p95_ms']),
+        'Storage Tier Read Host P99 (ms)': get_nested(summary, ['cache_stats', 'storage_read_host_p99_ms']),
+        'Storage Tier Read Host P99.9 (ms)': get_nested(summary, ['cache_stats', 'storage_read_host_p999_ms']),
+        'Storage Tier Read Host P99.99 (ms)': get_nested(summary, ['cache_stats', 'storage_read_host_p9999_ms']),
+        'Storage Tier Write Host P50 (ms)': get_nested(summary, ['cache_stats', 'storage_write_host_p50_ms']),
+        'Storage Tier Write Host P95 (ms)': get_nested(summary, ['cache_stats', 'storage_write_host_p95_ms']),
+        'Storage Tier Write Host P99 (ms)': get_nested(summary, ['cache_stats', 'storage_write_host_p99_ms']),
+        'Storage Tier Write Host P99.9 (ms)': get_nested(summary, ['cache_stats', 'storage_write_host_p999_ms']),
+        'Storage Tier Write Host P99.99 (ms)': get_nested(summary, ['cache_stats', 'storage_write_host_p9999_ms']),
+
+        # Cache Stats
+        'Cache Hit Rate': get_nested(summary, ['cache_stats', 'cache_hit_rate']),
+        'Read/Write Ratio': get_nested(summary, ['cache_stats', 'read_write_ratio']),
+        'Total Read (GB)': get_nested(summary, ['cache_stats', 'total_read_gb']),
+        'Total Write (GB)': get_nested(summary, ['cache_stats', 'total_write_gb']),
+
+        # Per-Tier KV Cache Bytes Written (NEW NAMING - MLPerf v3.0)
+        'Tier GPU KV Bytes Written (GB)': get_nested(summary, ['cache_stats', 'tier_gpu_kv_bytes_written_gb']),
+        'Tier CPU KV Bytes Written (GB)': get_nested(summary, ['cache_stats', 'tier_cpu_kv_bytes_written_gb']),
+        'Tier Storage KV Bytes Written (GB)': get_nested(summary, ['cache_stats', 'tier_storage_kv_bytes_written_gb']),
+
+        # Per-Tier KV Cache Bytes Read (NEW NAMING - MLPerf v3.0)
+        'Tier GPU KV Bytes Read (GB)': get_nested(summary, ['cache_stats', 'tier_gpu_kv_bytes_read_gb']),
+        'Tier CPU KV Bytes Read (GB)': get_nested(summary, ['cache_stats', 'tier_cpu_kv_bytes_read_gb']),
+        'Tier Storage KV Bytes Read (GB)': get_nested(summary, ['cache_stats', 'tier_storage_kv_bytes_read_gb']),
+
+        # Per-Tier Bandwidth (GB/s) - MLPerf v3.0 scoring metric
+        'Tier GPU Read Bandwidth (GB/s)': get_nested(summary, ['cache_stats', 'tier_gpu_read_bandwidth_gbps']),
+        'Tier GPU Write Bandwidth (GB/s)': get_nested(summary, ['cache_stats', 'tier_gpu_write_bandwidth_gbps']),
+        'Tier CPU Read Bandwidth (GB/s)': get_nested(summary, ['cache_stats', 'tier_cpu_read_bandwidth_gbps']),
+        'Tier CPU Write Bandwidth (GB/s)': get_nested(summary, ['cache_stats', 'tier_cpu_write_bandwidth_gbps']),
+        'Tier Storage Read Bandwidth (GB/s)': get_nested(summary, ['cache_stats', 'tier_storage_read_bandwidth_gbps']),
+        'Tier Storage Write Bandwidth (GB/s)': get_nested(summary, ['cache_stats', 'tier_storage_write_bandwidth_gbps']),
+
+        # Tier distribution
+        'GPU Entries': get_nested(summary, ['cache_stats', 'gpu_entries']),
+        'CPU Entries': get_nested(summary, ['cache_stats', 'cpu_entries']),
+        'Storage Entries': get_nested(summary, ['cache_stats', 'storage_entries']),
+
+        # Multi-turn stats
+        'Multi-turn Hit Rate': get_nested(summary, ['multi_turn_stats', 'hit_rate']),
+    }
+    
+    # Combine into single row with all data
+    combined_row = {**run_params, **metrics}
+    
+    # Create DataFrame
+    df = pd.DataFrame([combined_row])
+    
+    # Determine output format
+    use_excel = OPENPYXL_AVAILABLE and output_path.endswith('.xlsx')
+    
+    try:
+        if use_excel:
+            # Create Excel with multiple sheets for better organization
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # Sheet 1: Combined summary (single row for easy aggregation)
+                df.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Sheet 2: Run Parameters (vertical format for readability)
+                params_df = pd.DataFrame(list(run_params.items()), columns=['Parameter', 'Value'])
+                params_df.to_excel(writer, sheet_name='Run Parameters', index=False)
+                
+                # Sheet 3: Performance Metrics (vertical format)
+                metrics_df = pd.DataFrame(list(metrics.items()), columns=['Metric', 'Value'])
+                metrics_df.to_excel(writer, sheet_name='Performance Metrics', index=False)
+                
+                # Sheet 4: QoS Metrics if available
+                qos_metrics = summary.get('qos_metrics', {})
+                if qos_metrics:
+                    qos_rows = []
+                    for level, data in qos_metrics.items():
+                        if isinstance(data, dict) and not data.get('no_data'):
+                            qos_rows.append({
+                                'QoS Level': level,
+                                'Total Requests': data.get('total_requests'),
+                                'Latency P95 (ms)': get_nested(data, ['latency_ms', 'p95']),
+                                'Latency P99 (ms)': get_nested(data, ['latency_ms', 'p99']),
+                                'SLA Met': get_nested(data, ['sla', 'met']),
+                                'SLA Compliance': get_nested(data, ['sla', 'compliance']),
+                            })
+                    if qos_rows:
+                        qos_df = pd.DataFrame(qos_rows)
+                        qos_df.to_excel(writer, sheet_name='QoS Metrics', index=False)
+            
+            logger.info(f"XLSX results saved to {output_path}")
+        else:
+            # Fall back to CSV
+            csv_path = output_path.replace('.xlsx', '.csv') if output_path.endswith('.xlsx') else output_path
+            if not csv_path.endswith('.csv'):
+                csv_path += '.csv'
+            df.to_csv(csv_path, index=False)
+            logger.info(f"CSV results saved to {csv_path} (openpyxl not available for XLSX)")
+            
+    except Exception as e:
+        logger.error(f"Error saving XLSX/CSV: {e}")
+        # Last resort: try CSV
+        try:
+            csv_path = output_path.replace('.xlsx', '.csv')
+            df.to_csv(csv_path, index=False)
+            logger.info(f"Fallback CSV saved to {csv_path}")
+        except Exception as e2:
+            logger.error(f"Failed to save results: {e2}")
+
 
 if __name__ == "__main__":
     main()
