@@ -52,7 +52,7 @@ mlpstorage = 'mlpstorage.main:main'
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short --show-setup"
+addopts = "-v --tb=short --setup-show"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
