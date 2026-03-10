@@ -5,6 +5,9 @@ This module provides the ReportGenerator class for validating and
 reporting on benchmark results with clear OPEN vs CLOSED messaging.
 """
 
+from __future__ import annotations
+from typing import Union, Literal
+
 import csv
 import json
 import os.path
@@ -12,7 +15,7 @@ import pprint
 import sys
 
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 
 from mlpstorage.mlps_logging import setup_logging, apply_logging_options
 from mlpstorage.config import MLPS_DEBUG, BENCHMARK_TYPES, EXIT_CODE, PARAM_VALIDATION, LLM_MODELS, MODELS, ACCELERATORS
