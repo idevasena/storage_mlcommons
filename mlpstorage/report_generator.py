@@ -12,7 +12,7 @@ import pprint
 import sys
 
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Union, Literal
+from typing import List, Dict, Any, Optional, Union
 
 from mlpstorage.mlps_logging import setup_logging, apply_logging_options
 from mlpstorage.config import MLPS_DEBUG, BENCHMARK_TYPES, EXIT_CODE, PARAM_VALIDATION, LLM_MODELS, MODELS, ACCELERATORS
@@ -32,7 +32,7 @@ class Result:
     multi: bool
     benchmark_type: BENCHMARK_TYPES
     benchmark_command: str
-    benchmark_model: Literal[LLM_MODELS, MODELS, str]
+    benchmark_model: Union[LLM_MODELS, MODELS, str]
     benchmark_run: Union[BenchmarkRun, List[BenchmarkRun]]
     issues: List[Issue]
     category: PARAM_VALIDATION
