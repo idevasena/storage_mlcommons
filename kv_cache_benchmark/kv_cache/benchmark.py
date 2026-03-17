@@ -970,6 +970,38 @@ class IntegratedBenchmark:
         print(f"Generation Mode: {self.generation_mode.value} ({self.ms_per_token:.1f}ms/token)")
         print("=" * 80)
 
+        # ── KV Block Size Context ──────────────────────────────────────
+        # Raised on 2026-03-10 KV Cache TF call: latencies are per entire
+        # KV cache block, not per token or per 4 KB page.  Block sizes
+        # depend on model architecture and sequence length; they can range
+        # from tens of MB to multiple GB.
+        bpt = self.model_config.kv_cache_size_per_token
+        print(f"\nIMPORTANT: All storage latencies below are measured per KV cache BLOCK,")
+        print(f"not per token or per disk page.  Each block holds the full KV state for")
+        print(f"one request (all layers, all heads, full sequence length).")
+        print(f"  Model KV bytes/token: {bpt:,} bytes ({bpt/1024:.1f} KB)")
+
+        # Compute entry size distribution from live cache entries
+        with self.cache.metadata_lock:
+            entry_sizes = [e['size'] for e in self.cache.cache_entries.values()]
+        if entry_sizes:
+            sizes = np.array(entry_sizes)
+            print(f"  Entries in cache: {len(sizes)}")
+            print(f"  Block size min:   {np.min(sizes)/1024**2:.1f} MB")
+            print(f"  Block size mean:  {np.mean(sizes)/1024**2:.1f} MB")
+            print(f"  Block size P95:   {np.percentile(sizes, 95)/1024**2:.1f} MB")
+            print(f"  Block size max:   {np.max(sizes)/1024**2:.1f} MB")
+        else:
+            # Fall back to average from aggregate stats
+            total_write_bytes = summary.get('cache_stats', {}).get('total_write_bytes', 0)
+            write_ops = summary.get('cache_stats', {}).get('write_iops', 0)
+            if write_ops > 0:
+                avg_mb = (total_write_bytes / write_ops) / 1024**2
+                print(f"  Avg block size:   {avg_mb:.1f} MB (from {write_ops} writes)")
+
+        print(f"  A 200 MB block at 1 GB/s NVMe read = ~200 ms device latency.")
+        print(f"  Compare latencies against block sizes, not against 4 KB page I/O.\n")
+
         PASS_SYMBOL = "[OK]"
         FAIL_SYMBOL = "[X]"
 

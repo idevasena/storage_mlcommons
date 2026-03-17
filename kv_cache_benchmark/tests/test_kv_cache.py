@@ -600,11 +600,132 @@ class TestKVCacheGenerator:
     def test_determinism_same_key(self, kv_generator):
         data1 = kv_generator.generate(sequence_length=10, key="test_key")
         data2 = kv_generator.generate(sequence_length=10, key="test_key")
-        assert np.array_equal(data1, data2)
+        # Compare raw bytes: XOR-stamping may produce NaN bit patterns,
+        # and NaN != NaN under IEEE 754, so np.array_equal would fail
+        # even though the data is bit-identical.
+        assert data1.view(np.uint8).tobytes() == data2.view(np.uint8).tobytes()
     
     def test_different_key_runs(self, kv_generator):
         """Different key should not crash."""
         kv_generator.generate(sequence_length=10, key="different_key")
+
+
+# =============================================================================
+# Test 4b: Data Deduplication Resistance
+# =============================================================================
+
+class TestDedup:
+    """Verify that generated KV cache data resists 4 KB block deduplication.
+
+    Real NVMe controllers and storage appliances may transparently dedup
+    identical blocks, which would make the benchmark measure less I/O than
+    intended.  The XOR-stamp in KVCacheGenerator._apply_xor_stamp must
+    ensure zero (or near-zero) duplicate 4 KB blocks across entries and
+    within a single large entry.
+
+    Equivalent of the shell one-liner:
+        find /mnt/... -name '*.npy' -print0 | xargs -0 cat | sha256-block-check
+    """
+
+    @pytest.fixture
+    def tiny_model_config(self):
+        return MODEL_CONFIGS['tiny-1b']
+
+    def _block_dedup_ratio(self, data_list: list, block_size: int = 4096) -> dict:
+        """Hash every block_size chunk across all byte strings, return stats."""
+        import hashlib
+        blocks = {}
+        total = 0
+        for raw in data_list:
+            for offset in range(0, len(raw), block_size):
+                chunk = raw[offset:offset + block_size]
+                h = hashlib.sha256(chunk).digest()
+                blocks[h] = blocks.get(h, 0) + 1
+                total += 1
+        unique = len(blocks)
+        dedup_ratio = 1 - (unique / total) if total else 0
+        dupes = sum(v - 1 for v in blocks.values() if v > 1)
+        return dict(total=total, unique=unique, dupes=dupes, ratio=dedup_ratio)
+
+    def test_cross_entry_no_dedup(self, tiny_model_config):
+        """Different keys must produce zero duplicate 4 KB blocks."""
+        gen = KVCacheGenerator(tiny_model_config, global_seed=42)
+        raw_list = []
+        for i in range(50):
+            data = gen.generate(sequence_length=100, key=f"user_{i:04d}_ctx")
+            raw_list.append(data.view(np.uint8).tobytes())
+
+        stats = self._block_dedup_ratio(raw_list)
+        print(f"\n  Cross-entry dedup: {stats['total']:,} blocks, "
+              f"{stats['unique']:,} unique, ratio={stats['ratio']:.4%}")
+        assert stats['ratio'] < 0.01, (
+            f"Cross-entry dedup ratio {stats['ratio']:.2%} exceeds 1% — "
+            f"{stats['dupes']:,} duplicate blocks out of {stats['total']:,}"
+        )
+
+    def test_intra_entry_no_dedup(self, tiny_model_config):
+        """A single large entry must have no duplicate 4 KB blocks within itself.
+
+        Uses a long sequence so the entry exceeds the 256 MB precomputed buffer,
+        forcing the chunked-copy path.  Without the block-index XOR layer,
+        repeated buffer regions would produce ~90% intra-entry dedup.
+        """
+        # Make a model with enough layers/heads that 8192 tokens > 256 MB
+        # tiny-1b at 24 KB/tok: 8192 × 24 KB = 192 MB (under buffer)
+        # Use 16384 tokens → 384 MB (exceeds 256 MB buffer → large path)
+        gen = KVCacheGenerator(tiny_model_config, global_seed=42)
+        data = gen.generate(sequence_length=16384, key="big_entry")
+        raw = data.view(np.uint8).tobytes()
+
+        stats = self._block_dedup_ratio([raw])
+        print(f"\n  Intra-entry dedup: {stats['total']:,} blocks, "
+              f"{stats['unique']:,} unique, ratio={stats['ratio']:.4%}")
+        assert stats['ratio'] < 0.01, (
+            f"Intra-entry dedup ratio {stats['ratio']:.2%} exceeds 1% — "
+            f"{stats['dupes']:,} duplicate blocks out of {stats['total']:,}"
+        )
+
+    def test_combined_dedup_many_entries(self, tiny_model_config):
+        """Mixed workload: many entries of varying sizes, check overall dedup."""
+        gen = KVCacheGenerator(tiny_model_config, global_seed=99)
+        raw_list = []
+        seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 512, 1024, 2048]
+        for i, seq_len in enumerate(seq_lengths):
+            data = gen.generate(sequence_length=seq_len, key=f"req_{i:04d}")
+            raw_list.append(data.view(np.uint8).tobytes())
+
+        stats = self._block_dedup_ratio(raw_list)
+        total_mb = sum(len(r) for r in raw_list) / 1024**2
+        print(f"\n  Combined dedup ({total_mb:.1f} MB across {len(raw_list)} entries): "
+              f"{stats['total']:,} blocks, {stats['unique']:,} unique, "
+              f"ratio={stats['ratio']:.4%}")
+        assert stats['ratio'] < 0.01, (
+            f"Combined dedup ratio {stats['ratio']:.2%} exceeds 1% — "
+            f"{stats['dupes']:,} duplicate blocks out of {stats['total']:,}"
+        )
+
+    def test_determinism_preserves_dedup_resistance(self, tiny_model_config):
+        """Two runs with the same seed must produce identical bytes AND low dedup."""
+        gen1 = KVCacheGenerator(tiny_model_config, global_seed=42)
+        gen2 = KVCacheGenerator(tiny_model_config, global_seed=42)
+
+        for i in range(10):
+            key = f"det_test_{i}"
+            d1 = gen1.generate(sequence_length=512, key=key)
+            d2 = gen2.generate(sequence_length=512, key=key)
+            assert d1.view(np.uint8).tobytes() == d2.view(np.uint8).tobytes(), (
+                f"Entry {key} not bit-identical across generators"
+            )
+
+        # Also check dedup across the 10 entries
+        raw_list = []
+        gen3 = KVCacheGenerator(tiny_model_config, global_seed=42)
+        for i in range(10):
+            data = gen3.generate(sequence_length=512, key=f"det_test_{i}")
+            raw_list.append(data.view(np.uint8).tobytes())
+        stats = self._block_dedup_ratio(raw_list)
+        print(f"\n  Deterministic dedup: ratio={stats['ratio']:.4%}")
+        assert stats['ratio'] < 0.01
 
 
 # =============================================================================
