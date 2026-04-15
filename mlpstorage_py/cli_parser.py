@@ -227,11 +227,11 @@ def update_args(args):
             args.runtime = VECTORDB_DEFAULT_RUNTIME  # Default runtime if not provided
 
     # Check for list of lists in params and flatten them
-    if args.params:
+    if hasattr(args, 'params') and args.params:
         flattened_params = [item for sublist in args.params for item in sublist]
         setattr(args, 'params', flattened_params)
 
-    if args.mpi_params:
+    if hasattr(args, 'mpi_params') and args.mpi_params:
         flattened_mpi_params = [item for sublist in args.mpi_params for item in sublist]
         setattr(args,'mpi_params', flattened_mpi_params)
 

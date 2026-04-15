@@ -82,6 +82,7 @@ class VectorDBBenchmark(Benchmark):
         if self.command in self.command_method_map:
             self.logger.verboser(f"Executing command: {self.command}")
             self.command_method_map[self.command]()
+            return 0
         else:
             self.logger.error(f"Unsupported command: {self.command}")
             sys.exit(1)
