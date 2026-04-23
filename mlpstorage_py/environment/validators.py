@@ -103,6 +103,22 @@ def validate_ssh_connectivity(
         # Parse host:slots format (e.g., "node1:4" -> "node1")
         hostname = host_entry.split(':')[0].strip()
 
+        # Guard against malformed tokens that could only come from a parsing error
+        # upstream (see issue #322: users passing `--hosts='h1 h2'` with quotes get
+        # a single token containing whitespace).
+        if not hostname or any(ch.isspace() for ch in hostname):
+            results.append((
+                host_entry,
+                False,
+                (
+                    f"Invalid host token {host_entry!r}: contains whitespace or is empty. "
+                    "Hosts must be passed as separate arguments "
+                    "(e.g. `--hosts h1 h2 h3`) or comma-separated "
+                    "(e.g. `--hosts h1,h2,h3`), not as a single quoted string."
+                ),
+            ))
+            continue
+
         # Skip localhost entries
         if hostname.lower() in ('localhost', '127.0.0.1'):
             results.append((hostname, True, 'localhost (skipped)'))

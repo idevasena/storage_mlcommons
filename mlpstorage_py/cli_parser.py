@@ -6,6 +6,7 @@ using modular argument builders from the cli package.
 """
 
 import argparse
+import re
 import sys
 
 from mlpstorage_py import VERSION
@@ -243,14 +244,29 @@ def update_args(args):
         flattened_mpi_params = [item for sublist in args.mpi_params for item in sublist]
         setattr(args,'mpi_params', flattened_mpi_params)
 
-    if hasattr(args, 'hosts'):
-        print(f'Hosts is: {args.hosts}')
-        # hosts can be comma separated string or a list of strings. If it's a string, it is still a list of length 1
-        if len(args.hosts) == 1 and isinstance(args.hosts[0], str):
-            setattr(args, 'hosts', args.hosts[0].split(','))
-        print(f'Hosts is: {args.hosts}')
+    if hasattr(args, 'hosts') and args.hosts is not None:
+        # Accept any of the following equivalent forms and normalize to a clean list:
+        #   --hosts h1 h2 h3              -> ['h1', 'h2', 'h3']
+        #   --hosts h1,h2,h3              -> ['h1', 'h2', 'h3']
+        #   --hosts 'h1 h2 h3'            -> ['h1', 'h2', 'h3']   (quoted, e.g. from YAML)
+        #   --hosts='h1,h2,h3'            -> ['h1', 'h2', 'h3']   (DLIO subprocess form)
+        #   --hosts='h1 h2 h3'            -> ['h1', 'h2', 'h3']   (quoted after '=')
+        # This defends against the argparse + nargs='+' + '=' interaction documented in
+        # https://github.com/mlcommons/storage/issues/322.
+        raw = args.hosts if isinstance(args.hosts, list) else [args.hosts]
+        normalized = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            for tok in re.split(r'[,\s]+', item.strip()):
+                if tok:
+                    normalized.append(tok)
+        if not normalized:
+            print("ERROR: --hosts is empty after parsing", file=sys.stderr)
+            sys.exit(EXIT_CODE.INVALID_ARGUMENTS)
+        args.hosts = normalized
 
-    if not hasattr(args, "num_client_hosts") and hasattr(args, "hosts"):
+    if hasattr(args, 'hosts') and not getattr(args, 'num_client_hosts', None):
         setattr(args, "num_client_hosts", len(args.hosts))
 
 

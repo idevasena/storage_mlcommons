@@ -51,11 +51,15 @@ HELP_MESSAGES = {
     ),
     'client_hosts': (
         "Space-separated list of IP addresses or hostnames of the participating hosts. "
-        "\nExample: '--hosts 192.168.1.1 192.168.1.2 192.168.1.3' or '--hosts host1 host2 host3'. Slots can "
+        "\nExample: '--hosts 192.168.1.1 192.168.1.2 192.168.1.3' or '--hosts host1 host2 host3'. "
+        "Comma-separated values are also accepted: '--hosts host1,host2,host3'. "
+        "Slots can "
         "be specified by appending ':<num_slots>' to a hostname like so: '--hosts host1:2 host2:2'. This "
         "example will run 2 accelerators on each host. If slots are not specified the number of processes "
         "will be equally distributed across the hosts with any remainder being distributed evenly on the "
-        "remaining hosts in the order they are listed."
+        "remaining hosts in the order they are listed. "
+        "\nDo NOT use '--hosts=h1 h2' (with '=' and space); argparse will only bind 'h1' to --hosts "
+        "and treat 'h2' as a stray positional argument. Use '--hosts h1 h2' or '--hosts=h1,h2' instead."
     ),
     'category': "Benchmark category to be submitted.",
     'results_dir': "Directory where the benchmark results will be saved.",

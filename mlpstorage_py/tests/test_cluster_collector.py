@@ -724,10 +724,11 @@ class TestMPIImportErrorHandling:
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, 'cluster_info.json')
-            with open(output_path, 'w') as f:
-                json.dump(valid_output, f)
-
+            # Under the new implementation (issue #303 fix), the collector
+            # creates a uuid-named subdirectory inside its base tmp dir and
+            # writes cluster_info.json there. We exercise that path by
+            # supplying ``shared_tmp_dir`` and pinning the uuid so we know
+            # the final output path.
             import subprocess
             from unittest.mock import patch, MagicMock
 
@@ -735,12 +736,23 @@ class TestMPIImportErrorHandling:
             mock_result.returncode = 0
             mock_result.stderr = ""
 
-            with patch('subprocess.run', return_value=mock_result):
-                with patch.object(collector, '_write_collector_script'):
-                    with patch.object(collector, '_generate_mpi_command', return_value="mpirun test"):
-                        with patch('tempfile.TemporaryDirectory') as mock_tmpdir:
-                            mock_tmpdir.return_value.__enter__.return_value = tmpdir
+            with patch('mlpstorage_py.cluster_collector.uuid.uuid4') as mock_uuid:
+                mock_uuid.return_value.hex = 'abcdef012345'
+                working_dir = os.path.join(tmpdir, 'mlps_collector_abcdef012345')
+                os.makedirs(working_dir, exist_ok=True)
+                output_path = os.path.join(working_dir, 'cluster_info.json')
+                with open(output_path, 'w') as f:
+                    json.dump(valid_output, f)
 
+                collector.shared_tmp_dir = tmpdir
+
+                with patch('mlpstorage_py.cluster_collector.subprocess.run',
+                           return_value=mock_result):
+                    with patch.object(collector, '_write_collector_script'):
+                        with patch.object(
+                            collector, '_generate_mpi_command',
+                            return_value="mpirun test",
+                        ):
                             result = collector.collect()
 
                             assert 'host1' in result
