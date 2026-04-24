@@ -287,7 +287,7 @@ class TestBenchmarkVerifyBenchmark:
 
     @pytest.fixture
     def benchmark(self, tmp_path):
-        """Create a benchmark instance."""
+        """Create a benchmark instance with --closed semantics."""
         args = Namespace(
             debug=False,
             verbose=False,
@@ -299,6 +299,7 @@ class TestBenchmarkVerifyBenchmark:
             num_processes=8,
             accelerator_type='h100',
             closed=True,
+            open=False,
             allow_invalid_params=False
         )
 
@@ -343,8 +344,9 @@ class TestBenchmarkVerifyBenchmark:
         assert result is True
 
     def test_exits_for_open_when_closed_required(self, benchmark):
-        """Should exit for OPEN verification when closed is required."""
+        """Should exit for OPEN verification when --closed was passed."""
         benchmark.args.closed = True
+        benchmark.args.open = False
 
         with patch('mlpstorage.benchmarks.base.BenchmarkVerifier') as mock_verifier_class:
             mock_verifier = MagicMock()
@@ -355,8 +357,15 @@ class TestBenchmarkVerifyBenchmark:
                 benchmark.verify_benchmark()
 
     def test_allows_open_with_open_flag(self, benchmark):
-        """Should allow OPEN verification with --open flag."""
+        """Should allow OPEN verification when --open was passed.
+
+        Post-#349 fix: --open sets args.open=True (independent of args.closed).
+        Previously this test only set closed=False, which was indistinguishable
+        from "neither flag passed" and therefore did not actually exercise the
+        --open code path.
+        """
         benchmark.args.closed = False
+        benchmark.args.open = True
 
         with patch('mlpstorage.benchmarks.base.BenchmarkVerifier') as mock_verifier_class:
             mock_verifier = MagicMock()
@@ -367,10 +376,13 @@ class TestBenchmarkVerifyBenchmark:
 
         assert result is True
 
-    def test_returns_true_with_closed_false_no_open_attr(self, tmp_path):
-        """Should return True and warn when closed=False and no 'open' attr (default state)."""
-        # This simulates the default state when neither --closed nor --open is passed
-        # The CLI sets closed=False as default, and hasattr(args, 'open') is False
+    def test_returns_true_with_neither_flag_set(self, tmp_path):
+        """Should return True and warn when neither --closed nor --open is passed.
+
+        Post-#349 fix: the CLI parser now sets both args.closed=False and
+        args.open=False by default. The "no verification" warning branch
+        triggers only when *both* are False.
+        """
         args = Namespace(
             debug=False,
             verbose=False,
@@ -382,9 +394,9 @@ class TestBenchmarkVerifyBenchmark:
             num_processes=8,
             accelerator_type='h100',
             closed=False,  # Default when neither flag is passed
+            open=False,    # Default when neither flag is passed
             allow_invalid_params=False
         )
-        # Note: 'open' attribute should NOT be present for this test
 
         with patch('mlpstorage.benchmarks.base.generate_output_location') as mock_gen:
             mock_gen.return_value = str(tmp_path / "output")
@@ -398,7 +410,7 @@ class TestBenchmarkVerifyBenchmark:
 
             result = benchmark.verify_benchmark()
 
-        # Should return True early with warning (line 170-172 in base.py)
+        # Should return True early with warning (the "no verification" branch)
         assert result is True
 
 
@@ -546,6 +558,7 @@ class TestBenchmarkIntegration:
             num_processes=8,
             accelerator_type='h100',
             closed=True,
+            open=False,
             allow_invalid_params=False
         )
 
