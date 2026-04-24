@@ -50,6 +50,9 @@ class ValidationIssue(Exception):
             parts.append(f"Host: {self.host}")
         return "\n".join(parts)
 
+# Defensive: update_args() normalizes quoted/space-separated --hosts forms
+# before we get here, so this should never fire in normal flow. Kept as a
+# belt-and-suspenders guard against direct API callers that skip update_args.
 
 def validate_ssh_connectivity(
     hosts: List[str],

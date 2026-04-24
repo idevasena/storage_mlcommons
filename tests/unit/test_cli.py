@@ -613,7 +613,12 @@ class TestUpdateArgs:
         )
         update_args(args)
         assert args.runtime is not None
-
+    
+    def test_num_client_hosts_zero_is_preserved(self):
+        """Regression: --num-client-hosts 0 must not be re-derived from len(hosts)."""
+        args = Namespace(hosts=['h1', 'h2', 'h3'], num_client_hosts=0)
+        update_args(args)
+        assert args.num_client_hosts == 0
 
 class TestApplyYamlConfigOverrides:
     """Tests for apply_yaml_config_overrides function."""

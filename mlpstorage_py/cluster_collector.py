@@ -11,10 +11,9 @@ import os
 import shutil
 import socket
 import subprocess
-import tempfile
 import threading
 import time
-import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -1179,9 +1178,11 @@ class MPIClusterCollector:
         hosts: List[str],
         mpi_bin: str,
         logger,
+        results_dir: str,
         allow_run_as_root: bool = False,
         timeout_seconds: int = 60,
-        shared_tmp_dir: Optional[str] = None,
+        shared_staging_dir: Optional[str] = None,
+        shared_tmp_dir: Optional[str] = None,  # deprecated, see note below
         ssh_username: Optional[str] = None,
     ):
         """
@@ -1191,22 +1192,56 @@ class MPIClusterCollector:
             hosts: List of hostnames/IPs, optionally with slot counts (e.g., "host1:4").
             mpi_bin: MPI binary to use (MPIRUN or MPIEXEC constant).
             logger: Logger instance for messages.
+            results_dir: Absolute or relative path to the benchmark results
+                directory. The collector stages its helper script under
+                ``<results_dir>/collector-staging/``; the staged script
+                persists after the run as a debuggable artifact. This
+                replaces the previous per-invocation ``tempfile`` staging
+                directory so no programmatic ``rm -rf`` is ever issued over
+                SSH (see PR #347 review).
             allow_run_as_root: If True, adds --allow-run-as-root flag.
             timeout_seconds: Maximum time to wait for collection.
-            shared_tmp_dir: Optional path that is visible on every node. When set,
-                the collector writes the helper script under this path and skips
-                SSH-based staging. Typically used on clusters with a shared
-                scratch filesystem (NFS/Lustre/GPFS).
+            shared_staging_dir: Optional path that is visible on every node.
+                When set, the collector writes the helper script under this
+                path and skips SSH-based staging. Typically used on clusters
+                with a shared scratch filesystem (NFS/Lustre/GPFS).
+            shared_tmp_dir: Deprecated alias for ``shared_staging_dir``.
+                Kept for one release for backward compatibility; emits a
+                DeprecationWarning.
             ssh_username: Optional SSH username used when staging the script on
                 remote hosts. Defaults to the current user. Ignored when
-                ``shared_tmp_dir`` is set or when all hosts are localhost.
+                ``shared_staging_dir`` is set or when all hosts are localhost.
+
+        Raises:
+            ValueError: if ``results_dir`` is empty or None. Multi-host
+                collection without a results directory has no defensible
+                staging location now that tempdir-based staging is gone.
         """
+        if not results_dir:
+            raise ValueError(
+                "MPIClusterCollector requires results_dir for script staging"
+            )
+
+        # Backward compatibility for the old kwarg name. Drop in a future
+        # release.
+        if shared_tmp_dir is not None:
+            warnings.warn(
+                "shared_tmp_dir is deprecated; use shared_staging_dir instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if shared_staging_dir is None:
+                shared_staging_dir = shared_tmp_dir
+
         self.hosts = hosts
         self.mpi_bin = mpi_bin
         self.logger = logger
+        self.results_dir = os.path.abspath(results_dir)
         self.allow_run_as_root = allow_run_as_root
         self.timeout = timeout_seconds
-        self.shared_tmp_dir = shared_tmp_dir
+        self.shared_staging_dir = (
+            os.path.abspath(shared_staging_dir) if shared_staging_dir else None
+        )
         self.ssh_username = ssh_username
 
     def _get_unique_hosts(self) -> List[str]:
@@ -1323,7 +1358,7 @@ class MPIClusterCollector:
             target = self._ssh_target(host)
             try:
                 mkdir_cmd = [
-                    "ssh", *ssh_common, target, f"mkdir -p {remote_dir}"
+                    "ssh", *ssh_common, target, f"mkdir -p '{remote_dir}'"
                 ]
                 r = subprocess.run(
                     mkdir_cmd, capture_output=True, text=True,
@@ -1362,47 +1397,33 @@ class MPIClusterCollector:
                         f"Script staging on {host} failed: {err}"
                     )
                 else:
-                    self.logger.debug(
+                    self.logger.info(
                         f"Collector script staged on {host}:{remote_dir}"
                     )
         return results
-
-    def _cleanup_remote_staging(
-        self, remote_dir: str, hosts: List[str]
-    ) -> None:
-        """Best-effort removal of the staged directory on each remote host.
-
-        Failures here are logged at DEBUG level and never raised — cleanup
-        should not mask the real error from :meth:`collect`.
-        """
-        ssh_common = self._ssh_common_opts()
-
-        def clean_one(host: str) -> None:
-            try:
-                subprocess.run(
-                    ["ssh", *ssh_common, self._ssh_target(host),
-                     f"rm -rf {remote_dir}"],
-                    capture_output=True, text=True, timeout=10,
-                )
-            except Exception as e:
-                self.logger.debug(
-                    f"Remote cleanup on {host} failed (non-fatal): {e}"
-                )
-
-        max_workers = min(16, max(1, len(hosts)))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            list(ex.map(clean_one, hosts))
 
     def collect(self) -> Dict[str, Any]:
         """
         Execute MPI collection across all nodes.
 
-        The collector script is written to a per-invocation directory whose
-        absolute path is identical on every participating node. When
-        ``shared_tmp_dir`` is set that directory lives under the shared path
-        (no staging needed). Otherwise the directory lives under each host's
-        local ``tempfile.gettempdir()`` (typically ``/tmp``) and the helper
-        script is staged to each remote host via SCP before ``mpirun`` runs.
+        The collector script is written to ``<results_dir>/collector-staging/``
+        on the launch host and the same absolute path is created on each
+        remote host via SSH before the script is copied there with SCP.
+        Because ``results_dir`` is resolved to an absolute path at
+        construction time, the path is identical on every participating
+        node, which is what ``mpirun`` requires.
+
+        When ``shared_staging_dir`` is set the script is written under that
+        path and no SSH staging is performed (suitable for clusters with a
+        shared NFS/Lustre/GPFS scratch FS).
+
+        The staged script is **not removed** at the end of the run — it is
+        kept as a persistent run artifact so users can inspect it after a
+        failure. This is a deliberate design choice (see PR #347 review)
+        : programmatic ``rm -rf`` over SSH is
+        unacceptable. Consecutive runs against the same ``results_dir``
+        simply overwrite the script, which is safe and idempotent.
+
         This fixes issue #303, where the previous implementation assumed
         ``tempfile.TemporaryDirectory()`` on the launch host was visible to
         every rank.
@@ -1419,137 +1440,128 @@ class MPIClusterCollector:
         )
 
         # --- Decide where to place the helper script ---------------------
-        if self.shared_tmp_dir:
-            base_tmp = self.shared_tmp_dir
+        if self.shared_staging_dir:
+            staging_dir = self.shared_staging_dir
             use_staging = False
             self.logger.debug(
-                f"Using shared tmp dir (no SSH staging): {base_tmp}"
+                f"Using shared staging dir (no SSH staging): {staging_dir}"
             )
         else:
-            base_tmp = tempfile.gettempdir()
+            staging_dir = os.path.join(self.results_dir, "collector-staging")
             use_staging = True
 
-        # Unique per-invocation directory, same absolute path on every node
-        run_id = f"mlps_collector_{uuid.uuid4().hex[:12]}"
-        working_dir = os.path.join(base_tmp, run_id)
-        script_path = os.path.join(working_dir, "mlps_collector.py")
-        output_path = os.path.join(working_dir, "cluster_info.json")
+        script_path = os.path.join(staging_dir, "mlps_collector.py")
+        output_path = os.path.join(staging_dir, "cluster_info.json")
 
         remote_hosts_to_stage: List[str] = []
-        try:
-            os.makedirs(working_dir, exist_ok=True)
-            self._write_collector_script(script_path)
 
-            # --- Stage the script on remote hosts if needed --------------
-            if use_staging:
-                remote_hosts_to_stage = self._remote_hosts_needing_staging()
-                if remote_hosts_to_stage:
-                    self.logger.debug(
-                        f"Staging collector script to "
-                        f"{len(remote_hosts_to_stage)} remote host(s) "
-                        f"at {working_dir}"
-                    )
-                    stage_results = self._stage_script_on_remote_hosts(
-                        script_path, working_dir, remote_hosts_to_stage
-                    )
-                    failures = {
-                        h: e for h, e in stage_results.items() if e
-                    }
-                    if failures:
-                        raise RuntimeError(
-                            "Failed to stage collector script on "
-                            f"{len(failures)} host(s): {failures}. "
-                            "Verify passwordless SSH from the launch host, or "
-                            "set --cluster-collector-shared-tmp / "
-                            "MLPS_CLUSTER_COLLECTOR_SHARED_TMP to a directory "
-                            "visible on every node."
-                        )
+        os.makedirs(staging_dir, exist_ok=True)
+        self._write_collector_script(script_path)
+        self.logger.info(
+            f"Collector script staged at {script_path} "
+            f"(persisted as run artifact)"
+        )
 
-            # --- Build and run the mpirun command ------------------------
-            cmd = self._generate_mpi_command(script_path, output_path)
-            self.logger.debug(f"Running MPI collection command: {cmd}")
-
-            # Silence OpenSSH X11-forwarding warnings that mpirun's rsh/ssh
-            # PLM emits when XAUTHORITY is not set on the launch host
-            # ('Authorization required, but no authorization protocol
-            # specified'). Reported in issue #303.
-            env = os.environ.copy()
-            env.pop("DISPLAY", None)      # prevent SSH X11 forwarding handshake
-            env.pop("XAUTHORITY", None)   # and its cookie lookup
-            env.setdefault(
-                "PLM_RSH_AGENT",
-                "ssh -o ForwardX11=no -o ForwardX11Trusted=no "
-                "-o StrictHostKeyChecking=accept-new",
-            )
-
-            try:
-                result = subprocess.run(
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                    env=env,
+        # --- Stage the script on remote hosts if needed ------------------
+        if use_staging:
+            remote_hosts_to_stage = self._remote_hosts_needing_staging()
+            if remote_hosts_to_stage:
+                self.logger.info(
+                    f"Staging collector script to "
+                    f"{len(remote_hosts_to_stage)} remote host(s)..."
                 )
-            except subprocess.TimeoutExpired:
-                raise RuntimeError(
-                    f"MPI collection timed out after {self.timeout} seconds"
+                stage_results = self._stage_script_on_remote_hosts(
+                    script_path, staging_dir, remote_hosts_to_stage
                 )
-
-            # --- Parse the output written by rank 0 ----------------------
-            if os.path.exists(output_path):
-                with open(output_path, 'r') as f:
-                    collected_data = json.load(f)
-
-                if collected_data.get('_mpi_import_error'):
-                    error_msg = collected_data.get(
-                        '_error_message', 'mpi4py not available'
-                    )
-                    error_host = collected_data.get('_hostname', 'unknown')
+                failures = {
+                    h: e for h, e in stage_results.items() if e
+                }
+                if failures:
                     raise RuntimeError(
-                        f"MPI collection failed on host '{error_host}': "
-                        f"{error_msg}. Ensure mpi4py is installed on all "
-                        "cluster nodes."
+                        "Failed to stage collector script on "
+                        f"{len(failures)} host(s): {failures}. "
+                        "Verify passwordless SSH from the launch host, or "
+                        "set --cluster-collector-shared-staging / "
+                        "MLPS_CLUSTER_COLLECTOR_SHARED_STAGING to a "
+                        "directory visible on every node."
                     )
 
-                if result.returncode != 0:
-                    self.logger.warning(
-                        f"MPI collection returned non-zero exit code: "
-                        f"{result.returncode}\nstderr: {result.stderr}"
-                    )
+        # --- Build and run the mpirun command ----------------------------
+        cmd = self._generate_mpi_command(script_path, output_path)
+        self.logger.info(
+            f"Running MPI collection across {len(unique_hosts)} host(s)"
+        )
+        self.logger.debug(f"MPI command: {cmd}")
 
-                self.logger.debug(
-                    f"Successfully collected info from "
-                    f"{len(collected_data)} hosts"
-                )
-                return collected_data
+        # Silence OpenSSH X11-forwarding warnings that mpirun's rsh/ssh
+        # PLM emits when XAUTHORITY is not set on the launch host
+        # ('Authorization required, but no authorization protocol
+        # specified'). Reported in issue #303.
+        env = os.environ.copy()
+        env.pop("DISPLAY", None)      # prevent SSH X11 forwarding handshake
+        env.pop("XAUTHORITY", None)   # and its cookie lookup
+        env.setdefault(
+            "PLM_RSH_AGENT",
+            "ssh -o ForwardX11=no -o ForwardX11Trusted=no "
+            "-o StrictHostKeyChecking=accept-new",
+        )
 
-            # No output file — surface staging + mpirun context together.
-            staged_summary = (
-                remote_hosts_to_stage if remote_hosts_to_stage
-                else "[launch host only]"
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                env=env,
             )
+        except subprocess.TimeoutExpired:
             raise RuntimeError(
-                "MPI collection did not produce output file. "
-                f"Return code: {result.returncode}. "
-                f"Staged on: {staged_summary}. "
-                f"stderr: {result.stderr}"
+                f"MPI collection timed out after {self.timeout} seconds"
             )
 
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"MPI collection failed: {e}")
-        finally:
-            # Best-effort cleanup on remote hosts and the launch host.
-            if use_staging and remote_hosts_to_stage:
-                self._cleanup_remote_staging(
-                    working_dir, remote_hosts_to_stage
+        # --- Parse the output written by rank 0 --------------------------
+        if os.path.exists(output_path):
+            with open(output_path, 'r') as f:
+                collected_data = json.load(f)
+
+            if collected_data.get('_mpi_import_error'):
+                error_msg = collected_data.get(
+                    '_error_message', 'mpi4py not available'
                 )
-            try:
-                shutil.rmtree(working_dir, ignore_errors=True)
-            except Exception:  # pragma: no cover — defensive
-                pass
+                error_host = collected_data.get('_hostname', 'unknown')
+                raise RuntimeError(
+                    f"MPI collection failed on host '{error_host}': "
+                    f"{error_msg}. Ensure mpi4py is installed on all "
+                    "cluster nodes."
+                )
+
+            if result.returncode != 0:
+                self.logger.warning(
+                    f"MPI collection returned non-zero exit code: "
+                    f"{result.returncode}\nstderr: {result.stderr}"
+                )
+
+            self.logger.info(
+                f"MPI collection completed successfully "
+                f"({len(collected_data)} hosts reported)"
+            )
+            return collected_data
+
+        # No output file — surface staging + mpirun context together.
+        # The staged script is left in place on both launch and remote
+        # hosts so the failure can be diagnosed post-mortem.
+        staged_summary = (
+            remote_hosts_to_stage if remote_hosts_to_stage
+            else "[launch host only]"
+        )
+        raise RuntimeError(
+            "MPI collection did not produce output file. "
+            f"Return code: {result.returncode}. "
+            f"Staged on: {staged_summary}. "
+            f"Staged script (persisted for inspection): {script_path}. "
+            f"stderr: {result.stderr}"
+        )
 
     def collect_local_only(self) -> Dict[str, Any]:
         """
@@ -1566,10 +1578,12 @@ def collect_cluster_info(
     hosts: List[str],
     mpi_bin: str,
     logger,
+    results_dir: str,
     allow_run_as_root: bool = False,
     timeout_seconds: int = 60,
     fallback_to_local: bool = True,
-    shared_tmp_dir: Optional[str] = None,
+    shared_staging_dir: Optional[str] = None,
+    shared_tmp_dir: Optional[str] = None,  # deprecated, see note below
     ssh_username: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -1583,12 +1597,16 @@ def collect_cluster_info(
         hosts: List of hostnames/IPs to collect from.
         mpi_bin: MPI command to use.
         logger: Logger instance.
+        results_dir: Benchmark results directory. The helper script will be
+            staged under ``<results_dir>/collector-staging/`` and persists
+            after the run as a debuggable artifact. Required.
         allow_run_as_root: Whether to allow running as root.
         timeout_seconds: Timeout for MPI collection.
         fallback_to_local: If True, fall back to local collection on failure.
-        shared_tmp_dir: Optional path visible on every node. If provided,
+        shared_staging_dir: Optional path visible on every node. If provided,
             the collector skips SSH-based script staging. See
             :class:`MPIClusterCollector` for details.
+        shared_tmp_dir: Deprecated alias for ``shared_staging_dir``.
         ssh_username: Optional SSH username for remote script staging.
             Defaults to the current user.
 
@@ -1600,8 +1618,10 @@ def collect_cluster_info(
         hosts=hosts,
         mpi_bin=mpi_bin,
         logger=logger,
+        results_dir=results_dir,
         allow_run_as_root=allow_run_as_root,
         timeout_seconds=timeout_seconds,
+        shared_staging_dir=shared_staging_dir,
         shared_tmp_dir=shared_tmp_dir,
         ssh_username=ssh_username,
     )

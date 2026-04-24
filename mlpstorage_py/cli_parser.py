@@ -266,7 +266,7 @@ def update_args(args):
             sys.exit(EXIT_CODE.INVALID_ARGUMENTS)
         args.hosts = normalized
 
-    if hasattr(args, 'hosts') and not getattr(args, 'num_client_hosts', None):
+    if hasattr(args, 'hosts') and getattr(args, 'num_client_hosts', None) is None:
         setattr(args, "num_client_hosts", len(args.hosts))
 
 
