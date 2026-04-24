@@ -786,7 +786,14 @@ class Benchmark(BenchmarkInterface, abc.ABC):
         self.verification = self.benchmark_run_verifier.verify()
         self.logger.verboser(f'Benchmark verification result: {self.verification}')
 
-        if not self.args.closed and not hasattr(self.args, "open"):
+        # Use getattr so we're resilient to args objects built in tests that
+        # may not define one or both attributes. Neither flag set => warn and
+        # skip formal verification (fixes #349: --open was previously
+        # indistinguishable from "nothing passed").
+        closed_mode = getattr(self.args, 'closed', False)
+        open_mode = getattr(self.args, 'open', False)
+
+        if not closed_mode and not open_mode:
             self.logger.warning(f'Running the benchmark without verification for open or closed configurations. These results are not valid for submission. Use --open or --closed to specify a configuration.')
             return True
         if not self.BENCHMARK_TYPE:
@@ -806,11 +813,11 @@ class Benchmark(BenchmarkInterface, abc.ABC):
                 sys.exit(1)
 
         if self.verification == PARAM_VALIDATION.OPEN:
-            if self.args.closed == False:
-                # "--open" was passed
+            if open_mode:
                 self.logger.status(f'Running as allowed open configuration')
                 return True
             else:
+                # closed_mode is True here
                 self.logger.warning(f'Parameters allowed for open but not closed. Use --open and rerun the benchmark.')
                 sys.exit(1)
 

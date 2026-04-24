@@ -179,8 +179,10 @@ class KVCacheBenchmark(Benchmark):
         Returns:
             Exit code from benchmark execution.
         """
-        # Verify benchmark parameters if running for submission
-        if hasattr(self.args, 'closed') and self.args.closed:
+        # Verify benchmark parameters if running for submission (either
+        # --closed or --open). Previously only --closed triggered verification,
+        # so --open silently skipped it (related to #349).
+        if getattr(self.args, 'closed', False) or getattr(self.args, 'open', False):
             self.verify_benchmark()
 
         # Build the command

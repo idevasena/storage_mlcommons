@@ -208,18 +208,22 @@ def add_universal_arguments(parser):
         help="Use the given Object API as the data access method, defaults to S3"
     )
 
-    # Create a mutually exclusive group for closed/open options
+    # Create a mutually exclusive group for closed/open options.
+    # Both flags set their own independent boolean so downstream code can
+    # distinguish "--open passed", "--closed passed", and "neither passed".
     submission_group = standard_args.add_mutually_exclusive_group()
     submission_group.add_argument(
         "--open",
-        action="store_false",
-        dest="closed",
+        action="store_true",
+        dest="open",
         default=False,
         help="Run as an open submission"
     )
     submission_group.add_argument(
         "--closed",
         action="store_true",
+        dest="closed",
+        default=False,
         help="Run as a closed submission"
     )
 
